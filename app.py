@@ -5,6 +5,7 @@ from crewai import Agent, Task, Crew, Process
 from crewai.llm import LLM
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from crewai.tools import tool
 
 # --- CONFIGURATION DES SECRETS ---
 # Streamlit va chercher les clés dans ses secrets, on les injecte dans l'environnement pour LiteLLM
@@ -35,6 +36,7 @@ async def send_telegram(msg):
     requests.post(url, json=payload)
 
 # --- OUTIL DE DEMANDE D'OUTIL MANQUANT (RequestMissingTool) ---
+@tool("Demander un outil manquant")
 def demander_outil_manquant(outil: str):
     """Si un agent manque d'un outil, il utilise cette fonction pour envoyer un message."""
     msg = f"🚨 ALERTE AGENT : J'ai besoin de l'outil/clé suivant : {outil}. Ajoute-le dans les secrets Streamlit !"
