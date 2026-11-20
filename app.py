@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID = secret("TELEGRAM_CHAT_ID")
 # Noms de modèles modifiables depuis les secrets Streamlit (sans toucher au code)
 MODELES = {
     "groq": secret("MODEL_GROQ", "groq/llama-3.1-8b-instant"),
-    "gemini": secret("MODEL_GEMINI", "gemini/gemini-2.5-flash"),
+    "gemini": secret("MODEL_GEMINI", "gemini/gemini-3.8-flash"),
     "openrouter": secret(
         "MODEL_OPENROUTER", "openrouter/meta-llama/llama-3.1-8b-instruct:free"
     ),
