@@ -1,12 +1,6 @@
-crewai
+crewai[litellm]
+google-genai
 litellm
-python-telegram-bot
 streamlit
 requests
-yt-dlp
-ffmpeg-python
-moviepy
-weasyprint
-ebooklib
-Pillow
-python-dotenv
+python-telegram-bot>=21.0
