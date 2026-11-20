@@ -1,0 +1,12 @@
+crewai
+litellm
+python-telegram-bot
+streamlit
+requests
+yt-dlp
+ffmpeg-python
+moviepy
+weasyprint
+ebooklib
+Pillow
+python-dotenv
