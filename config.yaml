@@ -1,0 +1,29 @@
+model_list:
+  # 1. Groq (Le plus rapide)
+  - model_name: "cerveau-groq"
+    litellm_params:
+      model: "groq/llama3-8b-8192"
+      api_key: "os.environ/GROQ_API_KEY"
+
+  # 2. Google Gemini (Très intelligent)
+  - model_name: "cerveau-gemini"
+    litellm_params:
+      model: "gemini/gemini-1.5-flash"
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  # 3. OpenRouter (La roue de secours gratuite)
+  - model_name: "cerveau-openrouter"
+    litellm_params:
+      model: "openrouter/meta-llama/llama-3-8b-instruct:free"
+      api_key: "os.environ/OPENROUTER_API_KEY"
+
+  # 4. Mistral (Le remplaçant)
+  - model_name: "cerveau-mistral"
+    litellm_params:
+      model: "mistral/mistral-small-latest"
+      api_key: "os.environ/MISTRAL_API_KEY"
+
+router_settings:
+  # Si une clé est fatiguée (limite atteinte), LiteLLM change automatiquement de clé !
+  routing_strategy: "usage-based-routing-v2"
+  enable_pre_call_checks: true
