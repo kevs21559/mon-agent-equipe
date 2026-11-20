@@ -67,7 +67,7 @@ marketeur = Agent(
     role="Marketeur",
     goal="Rédiger des textes, e-books et scénarios vidéo convaincants.",
     backstory=f"Tu es un copywriter hors pair. Tu écris pour vendre. {REGLE_STRICTE}",
-    llm=get_llm("cerveau-mistral", 0.2),
+    llm=get_llm("cerveau-groq", 0.2),
     verbose=True
 )
 
