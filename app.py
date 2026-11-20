@@ -19,12 +19,22 @@ TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
 # --- INITIALISATION DES MODÈLES LITELLM ---
 # On utilise notre config.yaml pour le routage
 def get_llm(model_name="cerveau-groq", temp=0.2):
+    # On récupère la bonne clé selon le modèle demandé
+    api_key = ""
+    if "groq" in model_name:
+        api_key = os.environ.get("GROQ_API_KEY")
+    elif "gemini" in model_name:
+        api_key = os.environ.get("GEMINI_API_KEY")
+    elif "openrouter" in model_name:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+
     return LLM(
         model=model_name,
         temperature=temp,
-        api_base="http://0.0.0.0:4000", # LiteLLM tourne en local
-        custom_llm_provider="openai" # LiteLLM simule une API OpenAI
+        api_key=api_key, # On donne la clé directement ici !
+        custom_llm_provider="litellm" # On précise que c'est LiteLLM qui gère
     )
+
 
 # --- FONCTION POUR ENVOYER UN MESSAGE SUR TELEGRAM ---
 async def send_telegram(msg):
