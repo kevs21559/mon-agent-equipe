@@ -62,14 +62,23 @@ def get_llm(fournisseur="groq", temp=0.2):
 # ENVOI D'UN MESSAGE TELEGRAM
 # =====================================================
 def send_telegram(msg):
+    """Envoie un message au patron. Retourne (succès, détail)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False, "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant dans les secrets."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     try:
-        requests.post(url, json=payload, timeout=15)
+        # Telegram limite à 4096 caractères : on découpe
+        for i in range(0, max(len(msg), 1), 4000):
+            r = requests.post(
+                url,
+                json={"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": msg[i : i + 4000]},
+                timeout=15,
+            )
+            if not r.ok:
+                return False, r.text
+        return True, "OK"
     except Exception as e:
-        print(f"Erreur Telegram: {e}")
+        return False, str(e)
 
 
 # =====================================================
@@ -82,8 +91,8 @@ def demander_outil_manquant(outil: str) -> str:
         f"🚨 ALERTE AGENT : J'ai besoin de l'outil/clé suivant : {outil}. "
         "Ajoute-le dans les secrets Streamlit !"
     )
-    send_telegram(msg)
-    return "Message envoyé au patron."
+    ok, detail = send_telegram(msg)
+    return "Message envoyé au patron." if ok else f"Échec de l'envoi : {detail}"
 
 
 # =====================================================
@@ -227,7 +236,20 @@ if st.button("Lancer la mission"):
                 resultat = lancer_mission(ordre)
                 st.success("Mission terminée !")
                 st.write(resultat)
+                ok, detail = send_telegram(f"✅ Mission terminée : {ordre}\n\n{resultat}")
+                if ok:
+                    st.info("Résultat envoyé sur Telegram.")
+                else:
+                    st.warning(f"Telegram : {detail}")
             except Exception as e:
                 st.error(f"Erreur : {e}")
     else:
         st.warning("Veuillez écrire un ordre.")
+
+st.divider()
+if st.button("Tester Telegram"):
+    ok, detail = send_telegram("🔔 Test : le bot fonctionne, patron !")
+    if ok:
+        st.success("Message de test envoyé. Regarde ton Telegram.")
+    else:
+        st.error(f"Échec Telegram : {detail}")
