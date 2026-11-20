@@ -17,10 +17,7 @@ model_list:
       model: "openrouter/meta-llama/llama-3-8b-instruct:free"
       api_key: "os.environ/OPENROUTER_API_KEY"
 
-  # 4. Mistral (Le remplaçant)
-  - model_name: "cerveau-mistral"
-    litellm_params:
-      model: "mistral/mistral-small-latest"
+ 
       api_key: "os.environ/MISTRAL_API_KEY"
 
 router_settings:
