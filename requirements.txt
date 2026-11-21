@@ -8,6 +8,7 @@ moviepy>=2.0
 pillow>=10.1
 numpy
 reportlab
+python-docx
 edge-tts
 gTTS
 ddgs
