@@ -919,7 +919,7 @@ def fabriquer_video_livre(titre, auteur, texte, couleur="#5b2a1f", voix=True, pa
 # =====================================================
 # PUBLICATION : YOUTUBE SHORTS
 # =====================================================
-def publier_youtube(chemin, titre, description):
+def publier_youtube(chemin, titre, description, confidentialite=None):
     cid = secret("YT_CLIENT_ID")
     csec = secret("YT_CLIENT_SECRET")
     rtok = secret("YT_REFRESH_TOKEN")
@@ -943,7 +943,7 @@ def publier_youtube(chemin, titre, description):
         corps = {
             "snippet": {"title": titre[:100], "description": desc, "categoryId": "22"},
             "status": {
-                "privacyStatus": secret("YT_PRIVACY", "private"),
+                "privacyStatus": confidentialite or secret("YT_PRIVACY", "private"),
                 "selfDeclaredMadeForKids": False,
             },
         }
@@ -1451,6 +1451,20 @@ if "combo" in st.session_state:
     st.video(chemin_v)
     with open(chemin_l, encoding="utf-8") as fh:
         components.html(fh.read(), height=720, scrolling=False)
+
+st.subheader("📤 Test de publication YouTube")
+st.caption("Crée une mini vidéo et l'envoie sur ta chaîne en PRIVÉ (visible par toi seul).")
+if st.button("Tester l'envoi YouTube (privé)"):
+    try:
+        with st.spinner("Création et envoi de la vidéo..."):
+            chemin_t = fabriquer_video("Test de publication\nTout fonctionne", "test_yt")
+            res_yt = publier_youtube(chemin_t, "Test agence (à supprimer)", "Vidéo de test", "private")
+        if "envoyé" in res_yt:
+            st.success(res_yt)
+        else:
+            st.error(res_yt)
+    except Exception as e:
+        st.error(f"Échec : {e}")
 
 st.subheader("📁 Fichiers produits")
 fichiers = []
