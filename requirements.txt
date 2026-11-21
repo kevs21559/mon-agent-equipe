@@ -9,5 +9,6 @@ pillow>=10.1
 numpy
 edge-tts
 gTTS
+ddgs
 google-api-python-client
 google-auth
