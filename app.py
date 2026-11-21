@@ -917,6 +917,127 @@ def fabriquer_video_livre(titre, auteur, texte, couleur="#5b2a1f", voix=True, pa
 
 
 # =====================================================
+# CHARIOW (lecture : boutique, produits, ventes) — l'API ne permet pas de créer des produits
+# =====================================================
+# --- CHARIOW START ---
+CHARIOW_URL = "https://api.chariow.com/v1"
+PERIODES_CHARIOW = {
+    "aujourdhui": "today", "hier": "yesterday", "7j": "last7days", "30j": "last30days",
+    "semaine": "thisWeek", "mois": "thisMonth", "mois_dernier": "lastMonth", "annee": "thisYear",
+}
+PERIODES_VALIDES = {
+    "today", "yesterday", "last7days", "last30days", "thisWeek", "lastWeek",
+    "thisMonth", "lastMonth", "thisYear", "lastYear",
+}
+
+
+def _periode(p):
+    p = (p or "30j").strip()
+    p = PERIODES_CHARIOW.get(p.lower(), p)
+    return p if p in PERIODES_VALIDES else "last30days"
+
+
+def chariow_get(chemin, params=None):
+    cle = secret("CHARIOW_API_KEY").strip()
+    if not cle:
+        raise RuntimeError("Secret CHARIOW_API_KEY manquant dans Streamlit.")
+    r = requests.get(
+        f"{CHARIOW_URL}{chemin}",
+        params=params,
+        headers={"Authorization": f"Bearer {cle}"},
+        timeout=20,
+    )
+    if r.status_code == 401:
+        raise RuntimeError("Clé Chariow refusée (401) : clé fausse, supprimée ou mal copiée.")
+    if r.status_code == 403:
+        try:
+            msg = r.json().get("message", "")
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"Droits insuffisants (403) : {msg} Ajoute le droit dans Chariow, Paramètres, Clés API.")
+    r.raise_for_status()
+    return r.json()
+
+
+def resume_boutique():
+    d = chariow_get("/store").get("data", {})
+    clients = d.get("stats", {}).get("total_customers")
+    return (
+        f"Boutique : {d.get('name')} (statut : {d.get('status')})\n"
+        f"Adresse : {d.get('url')}\n"
+        f"Clients : {clients}"
+    )
+
+
+def resume_produits(max_pages=3):
+    produits, curseur = [], None
+    for _ in range(max_pages):
+        params = {"per_page": 50}
+        if curseur:
+            params["cursor"] = curseur
+        rep = chariow_get("/products", params)
+        produits += rep.get("data", [])
+        pag = rep.get("pagination", {})
+        curseur = pag.get("next_cursor")
+        if not pag.get("has_more_pages") or not curseur:
+            break
+    if not produits:
+        return "Aucun produit dans la boutique Chariow."
+    lignes = []
+    for p in produits:
+        prix = "gratuit" if p.get("is_free") else (
+            (p.get("pricing") or {}).get("effective", {}).get("formatted") or "prix inconnu"
+        )
+        ventes = (p.get("sales_count") or {}).get("value", 0)
+        lignes.append(
+            f"- {p.get('name')} | type : {p.get('type')} | statut : {p.get('status')} | "
+            f"prix : {prix} | ventes : {ventes}"
+        )
+    return f"{len(produits)} produit(s) :\n" + "\n".join(lignes)
+
+
+def resume_ventes(periode="30j"):
+    per = _periode(periode)
+    ventes, curseur, plus = [], None, False
+    for _ in range(5):
+        params = {"period": per, "per_page": 100}
+        if curseur:
+            params["cursor"] = curseur
+        rep = chariow_get("/sales", params)
+        ventes += rep.get("data", [])
+        pag = rep.get("pagination", {})
+        curseur = pag.get("next_cursor")
+        plus = bool(pag.get("has_more_pages") and curseur)
+        if not plus:
+            break
+    if not ventes:
+        return f"Aucune vente sur la période ({per})."
+    statuts, revenus, par_produit = {}, {}, {}
+    for v in ventes:
+        st_v = v.get("status", "?")
+        statuts[st_v] = statuts.get(st_v, 0) + 1
+        if st_v in ("completed", "settled"):
+            mont = v.get("amount") or {}
+            devise = mont.get("currency", "?")
+            revenus[devise] = revenus.get(devise, 0) + (mont.get("value") or 0)
+            nom = (v.get("product") or {}).get("name", "?")
+            par_produit[nom] = par_produit.get(nom, 0) + 1
+    payees = statuts.get("completed", 0) + statuts.get("settled", 0)
+    txt = [f"Période : {per}", f"Ventes payées : {payees} sur {len(ventes)} commandes"]
+    if revenus:
+        txt.append("Revenus : " + ", ".join(f"{s:,.2f} {d}".replace(",", " ") for d, s in revenus.items()))
+    if par_produit:
+        txt.append("Par produit : " + ", ".join(f"{n} ({c})" for n, c in sorted(par_produit.items(), key=lambda x: -x[1])))
+    autres = {k: c for k, c in statuts.items() if k not in ("completed", "settled")}
+    if autres:
+        txt.append("Autres statuts : " + ", ".join(f"{k} ({c})" for k, c in autres.items()))
+    if plus:
+        txt.append("(Plus de 500 commandes : résultat partiel.)")
+    return "\n".join(txt)
+# --- CHARIOW END ---
+
+
+# =====================================================
 # PUBLICATION : YOUTUBE SHORTS
 # =====================================================
 def publier_youtube(chemin, titre, description, confidentialite=None):
@@ -1131,6 +1252,33 @@ def creer_video_et_ebook(titre: str, auteur: str, texte: str, couleur: str = "#5
     return "\n".join(lignes)
 
 
+@tool("Chariow boutique")
+def chariow_boutique_outil(details: str = "") -> str:
+    """Donne les informations réelles de la boutique Chariow du patron : nom, adresse (URL), statut, nombre de clients."""
+    try:
+        return resume_boutique()
+    except Exception as e:
+        return f"Chariow indisponible : {e}"
+
+
+@tool("Chariow produits")
+def chariow_produits_outil(details: str = "") -> str:
+    """Liste les produits réels de la boutique Chariow du patron (nom, type, statut, prix, ventes). À utiliser avant de parler d'un produit : ne jamais inventer de produit ni de prix."""
+    try:
+        return resume_produits()
+    except Exception as e:
+        return f"Chariow indisponible : {e}"
+
+
+@tool("Chariow ventes")
+def chariow_ventes_outil(periode: str = "30j") -> str:
+    """Résume les ventes réelles de la boutique Chariow sur une période : aujourdhui, hier, 7j, 30j, semaine, mois, mois_dernier, annee."""
+    try:
+        return resume_ventes(periode)
+    except Exception as e:
+        return f"Chariow indisponible : {e}"
+
+
 @tool("Creer un logiciel")
 def creer_logiciel(nom: str, code: str, extension: str = "html") -> str:
     """Enregistre un logiciel complet dans un seul fichier (html de préférence : fonctionne sur tous les écrans ; sinon py, js, css, json, md, txt). 'code' = le contenu COMPLET du fichier. Le fichier est envoyé au patron sur Telegram. Ne s'exécute pas sur le serveur."""
@@ -1165,7 +1313,7 @@ def creer_agents():
         backstory=f"Tu es un chasseur de clients. {REGLE_STRICTE}",
         llm=get_llm("groq", 0.1),
         verbose=True,
-        tools=[demander_outil_manquant],
+        tools=[chariow_ventes_outil, chariow_produits_outil, demander_outil_manquant],
     )
     marketeur = Agent(
         role="Marketeur",
@@ -1173,6 +1321,7 @@ def creer_agents():
         backstory=f"Tu es un copywriter hors pair. Tu écris pour vendre. {REGLE_STRICTE}",
         llm=get_llm("groq", 0.2),
         verbose=True,
+        tools=[chariow_produits_outil, chariow_boutique_outil],
     )
     codeur = Agent(
         role="Codeur",
@@ -1207,7 +1356,7 @@ def creer_agents():
         ),
         llm=get_llm("openrouter", 0.2),
         verbose=True,
-        tools=[proposer_publication, demander_outil_manquant],
+        tools=[proposer_publication, chariow_produits_outil, chariow_boutique_outil, demander_outil_manquant],
     )
     return responsable, chercheur, marketeur, humaniseur, codeur, community_manager
 
@@ -1219,6 +1368,7 @@ def lancer_mission(ordre_du_patron):
             f"Réalise la mission suivante demandée par le patron : {ordre_du_patron}\n"
             "Méthode : le Marketeur écrit, l'Humaniseur réécrit TOUT texte destiné au public, "
             "puis le Codeur le met en forme avec ses outils (vidéo, ebook 3D, logiciel). Si le patron veut un livre ET une vidéo avec voix off, utilise l'outil 'Creer video et ebook 3D'. "
+            "Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
             "Rien n'est publié sans validation du patron."
         ),
         expected_output="Un résultat clair, basé uniquement sur des informations vérifiables.",
@@ -1245,7 +1395,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Bonjour patron ! Envoyez-moi un ordre.\n"
-        "Pour une publication proposée : /valider ID ou /refuser ID"
+        "Pour une publication proposée : /valider ID ou /refuser ID\n"
+        "Chariow : /ventes (7j, 30j, mois, hier, aujourdhui) et /produits"
     )
 
 
@@ -1268,6 +1419,27 @@ async def refuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     existe = PENDING.pop(context.args[0], None)
     await update.message.reply_text("Publication annulée." if existe else "ID inconnu.")
+
+
+async def ventes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorise(update):
+        return
+    periode = context.args[0] if context.args else "30j"
+    try:
+        res = await asyncio.to_thread(resume_ventes, periode)
+    except Exception as e:
+        res = f"Chariow : {e}"
+    await update.message.reply_text(res[:4000])
+
+
+async def produits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorise(update):
+        return
+    try:
+        res = await asyncio.to_thread(resume_produits)
+    except Exception as e:
+        res = f"Chariow : {e}"
+    await update.message.reply_text(res[:4000])
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1300,6 +1472,8 @@ def run_telegram_bot():
         bot_app.add_handler(CommandHandler("start", start))
         bot_app.add_handler(CommandHandler("valider", valider))
         bot_app.add_handler(CommandHandler("refuser", refuser))
+        bot_app.add_handler(CommandHandler("ventes", ventes_cmd))
+        bot_app.add_handler(CommandHandler("produits", produits_cmd))
         bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         bot_app.run_polling(stop_signals=None, close_loop=False)
     except Exception as e:
@@ -1465,6 +1639,22 @@ if st.button("Tester l'envoi YouTube (privé)"):
             st.error(res_yt)
     except Exception as e:
         st.error(f"Échec : {e}")
+
+st.subheader("🛒 Test Chariow")
+st.caption("Lit ta boutique, tes produits et tes ventes des 30 derniers jours (lecture seule).")
+if st.button("Tester Chariow"):
+    for titre_c, fonction_c in (
+        ("Boutique", resume_boutique),
+        ("Produits", resume_produits),
+        ("Ventes (30 jours)", resume_ventes),
+    ):
+        try:
+            with st.spinner(f"{titre_c}..."):
+                texte_c = fonction_c()
+            st.success(titre_c)
+            st.text(texte_c)
+        except Exception as e:
+            st.error(f"{titre_c} : {e}")
 
 st.subheader("📁 Fichiers produits")
 fichiers = []
