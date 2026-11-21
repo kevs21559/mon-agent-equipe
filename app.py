@@ -1,8 +1,12 @@
 import os
 import re
+import csv
+import socket
+import ipaddress
+import datetime
 import base64
 from io import BytesIO
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urljoin
 import json
 import html
 import uuid
@@ -1038,6 +1042,233 @@ def resume_ventes(periode="30j"):
 
 
 # =====================================================
+# PROSPECTION B2B ET VISIBILITÉ : recherche web, lecture de pages, carnet de prospects, audit
+# =====================================================
+# --- PROSPECTION START ---
+FICHIER_PROSPECTS = os.path.join(DOSSIER_FICHIERS, "prospects.json")
+
+
+def _chercher(requete, n=8):
+    """Recherche web : Serper (clé SERPER_API_KEY, fiable) ou DuckDuckGo (gratuit, moins stable)."""
+    cle = secret("SERPER_API_KEY").strip()
+    if cle:
+        r = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": cle, "Content-Type": "application/json"},
+            json={"q": requete, "num": n, "hl": "fr"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return [
+            {"titre": x.get("title", ""), "lien": x.get("link", ""), "extrait": x.get("snippet", "")}
+            for x in r.json().get("organic", [])[:n]
+        ]
+    from ddgs import DDGS
+
+    res = DDGS().text(requete, max_results=n, region="fr-fr")
+    return [
+        {"titre": x.get("title", ""), "lien": x.get("href", ""), "extrait": x.get("body", "")}
+        for x in res
+    ]
+
+
+def _url_publique(url):
+    """Refuse les adresses locales ou privées (sécurité)."""
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("URL invalide (http ou https requis).")
+    for info in socket.getaddrinfo(p.hostname, None):
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise ValueError("Adresse non publique refusée.")
+    return url
+
+
+def _telecharger(url, max_octets=1_500_000):
+    """Télécharge une page en vérifiant chaque redirection. Retourne (code, url_finale, texte)."""
+    for _ in range(5):
+        _url_publique(url)
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AgenceBot/1.0)"},
+            timeout=15,
+            allow_redirects=False,
+            stream=True,
+        )
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+            url = urljoin(url, r.headers["Location"])
+            r.close()
+            continue
+        donnees = b""
+        for morceau in r.iter_content(65536):
+            donnees += morceau
+            if len(donnees) > max_octets:
+                break
+        r.close()
+        return r.status_code, url, donnees.decode(r.encoding or "utf-8", errors="replace")
+    raise ValueError("Trop de redirections.")
+
+
+def _analyser_html(texte, url):
+    def meta(nom):
+        motifs = (
+            r'<meta[^>]+(?:name|property)=["\']%s["\'][^>]*content=["\']([^"\']*)["\']',
+            r'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:name|property)=["\']%s["\']',
+        )
+        for m_ in motifs:
+            trouve = re.search(m_ % re.escape(nom), texte, re.I)
+            if trouve:
+                return html.unescape(trouve.group(1)).strip()
+        return ""
+
+    t = re.search(r"<title[^>]*>(.*?)</title>", texte, re.I | re.S)
+    titre = html.unescape(re.sub(r"\s+", " ", t.group(1))).strip() if t else ""
+    propre = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", texte, flags=re.I | re.S)
+    propre = re.sub(r"<[^>]+>", " ", propre)
+    propre = re.sub(r"\s+", " ", html.unescape(propre)).strip()
+    emails = sorted(
+        {
+            e.lower()
+            for e in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", texte)
+            if not e.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"))
+            and "example" not in e.lower()
+            and "sentry" not in e.lower()
+        }
+    )
+    return {
+        "url": url,
+        "titre": titre,
+        "description": meta("description"),
+        "h1": len(re.findall(r"<h1[\s>]", texte, re.I)),
+        "og_titre": meta("og:title"),
+        "og_image": meta("og:image"),
+        "robots": meta("robots"),
+        "canonical": bool(re.search(r'<link[^>]+rel=["\']canonical["\']', texte, re.I)),
+        "emails": emails[:5],
+        "texte": propre,
+    }
+
+
+def lire_page(url):
+    code, finale, texte = _telecharger(url)
+    if code >= 400:
+        return f"Page inaccessible (code {code})."
+    a = _analyser_html(texte, finale)
+    return (
+        f"Adresse : {a['url']}\n"
+        f"Titre : {a['titre']}\n"
+        f"Description : {a['description']}\n"
+        f"E-mails publics trouvés : {', '.join(a['emails']) or 'aucun'}\n"
+        f"Extrait : {a['texte'][:1500]}"
+    )
+
+
+def resume_recherche(requete, n=8):
+    res = _chercher(requete, n)
+    if not res:
+        return "Aucun résultat."
+    return "\n".join(f"{i}. {r['titre']}\n   {r['lien']}\n   {r['extrait'][:200]}" for i, r in enumerate(res, 1))
+
+
+def audit_visibilite(url=""):
+    """Contrôle simple de la visibilité de la boutique (page d'accueil, réseaux, présence dans les moteurs)."""
+    manquants = []
+    if not url:
+        boutique = chariow_get("/store").get("data", {})
+        url = boutique.get("url", "")
+        manquants = [k for k, v in (boutique.get("social_links") or {}).items() if not v]
+    if not url:
+        return "Adresse de boutique introuvable."
+    code, finale, texte = _telecharger(url)
+    if code >= 400:
+        return f"La boutique répond avec le code {code} : elle n'est pas accessible."
+    a = _analyser_html(texte, finale)
+    ok, alertes, a_faire = [], [], []
+
+    if 20 <= len(a["titre"]) <= 65:
+        ok.append(f"Titre de page correct ({len(a['titre'])} caractères)")
+    else:
+        alertes.append(f"Titre de page à revoir ({len(a['titre'])} caractères, idéal 20 à 65)")
+        a_faire.append("Mettre un titre de boutique clair avec ton domaine d'activité")
+    if 70 <= len(a["description"]) <= 160:
+        ok.append("Description de page correcte")
+    else:
+        alertes.append(f"Description absente ou mal dimensionnée ({len(a['description'])} caractères, idéal 70 à 160)")
+        a_faire.append("Écrire une description de boutique de 70 à 160 caractères avec tes mots-clés")
+    if a["h1"] == 1:
+        ok.append("Un seul titre principal (H1)")
+    else:
+        alertes.append(f"{a['h1']} titre(s) principal(aux) H1 trouvé(s) (idéal : 1)")
+    if a["og_titre"] and a["og_image"]:
+        ok.append("Aperçu de partage (réseaux sociaux) présent")
+    else:
+        alertes.append("Aperçu de partage incomplet (titre ou image manquant)")
+        a_faire.append("Ajouter une image et un titre de partage pour que les liens soient jolis sur les réseaux")
+    if "noindex" in a["robots"].lower():
+        alertes.append("❌ La page demande aux moteurs de NE PAS l'indexer (noindex)")
+        a_faire.append("Retirer le noindex : sinon Google n'affichera pas ta boutique")
+    if manquants:
+        alertes.append("Réseaux non reliés à la boutique : " + ", ".join(manquants))
+        a_faire.append("Ajouter tes liens de réseaux dans les paramètres de la boutique Chariow")
+
+    domaine = urlparse(finale).hostname or url
+    try:
+        resultats = _chercher(f"site:{domaine}", 10)
+        if resultats:
+            ok.append(f"Présence dans les moteurs : {len(resultats)} page(s) trouvée(s) pour site:{domaine}")
+        else:
+            alertes.append(f"Aucune page trouvée pour site:{domaine} : la boutique n'est probablement pas encore indexée")
+            a_faire.append("Partager le lien de la boutique partout (réseaux, vidéos, profils) pour accélérer l'indexation")
+    except Exception as e:
+        alertes.append(f"Recherche impossible pour vérifier l'indexation ({e})")
+
+    a_faire.append("Publier régulièrement des vidéos courtes avec le lien de la boutique en description")
+    txt = [f"Audit de visibilité : {finale}"]
+    txt += ["✅ " + x for x in ok]
+    txt += ["⚠️ " + x for x in alertes]
+    txt.append("À faire en priorité :")
+    txt += [f"{i}. {x}" for i, x in enumerate(a_faire, 1)]
+    return "\n".join(txt)
+
+
+# --- Carnet de prospects ---
+def charger_prospects():
+    try:
+        with open(FICHIER_PROSPECTS, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def sauver_prospect(entreprise, site, contact, secteur, raison, message):
+    """Retourne True si ajouté, False si déjà présent (même site)."""
+    liste = charger_prospects()
+    domaine = urlparse(site).hostname or site
+    if any((urlparse(p.get("site", "")).hostname or p.get("site", "")) == domaine for p in liste):
+        return False
+    liste.append(
+        {
+            "date": datetime.date.today().isoformat(),
+            "entreprise": entreprise, "site": site, "contact": contact,
+            "secteur": secteur, "raison": raison, "message": message, "statut": "à contacter",
+        }
+    )
+    with open(FICHIER_PROSPECTS, "w", encoding="utf-8") as f:
+        json.dump(liste, f, ensure_ascii=False, indent=1)
+    return True
+
+
+def prospects_csv():
+    chemin = os.path.join(DOSSIER_FICHIERS, "prospects.csv")
+    champs = ["date", "entreprise", "site", "contact", "secteur", "raison", "message", "statut"]
+    with open(chemin, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=champs, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(charger_prospects())
+    return chemin
+# --- PROSPECTION END ---
+
+
+# =====================================================
 # PUBLICATION : YOUTUBE SHORTS
 # =====================================================
 def publier_youtube(chemin, titre, description, confidentialite=None):
@@ -1279,6 +1510,49 @@ def chariow_ventes_outil(periode: str = "30j") -> str:
         return f"Chariow indisponible : {e}"
 
 
+@tool("Rechercher sur le web")
+def rechercher_web_outil(requete: str, nombre: int = 8) -> str:
+    """Cherche sur le web (titres, adresses, extraits). Sert à trouver des entreprises, des clients potentiels, des tendances. Donne toujours les adresses (URL) comme sources."""
+    try:
+        return resume_recherche(requete, max(1, min(int(nombre), 10)))
+    except Exception as e:
+        return f"Recherche impossible : {e}. Si l'erreur persiste, demande au patron une clé SERPER_API_KEY."
+
+
+@tool("Lire une page web")
+def lire_page_outil(url: str) -> str:
+    """Lit une page web publique : titre, description, e-mails professionnels publiés, extrait du texte. À utiliser pour vérifier ce qu'une entreprise fait avant de la contacter."""
+    try:
+        return lire_page(url)
+    except Exception as e:
+        return f"Lecture impossible : {e}"
+
+
+@tool("Enregistrer un prospect")
+def enregistrer_prospect_outil(entreprise: str, site: str, contact: str, secteur: str, raison: str, message: str) -> str:
+    """Ajoute une entreprise au carnet de prospects et l'envoie au patron sur Telegram. 'site' = adresse réelle vérifiée. 'contact' = e-mail professionnel public trouvé sur le site (ou vide). 'raison' = pourquoi ce prospect est pertinent, basé sur des faits lus sur sa page. 'message' = proposition de premier message, personnalisée, honnête et courte. Ne contacte personne."""
+    if not site.lower().startswith(("http://", "https://")):
+        return "Refusé : 'site' doit être une adresse réelle commençant par http."
+    if len(raison.strip()) < 15:
+        return "Refusé : explique avec des faits pourquoi ce prospect est pertinent."
+    if not sauver_prospect(entreprise, site, contact, secteur, raison, message):
+        return "Ce prospect (même site) est déjà dans le carnet."
+    send_telegram(
+        f"🎯 Nouveau prospect : {entreprise}\nSite : {site}\nContact : {contact or 'à trouver'}\n"
+        f"Pourquoi : {raison}\n\nMessage proposé :\n{message}"
+    )
+    return "Prospect enregistré et envoyé au patron. Aucun message n'a été envoyé au prospect."
+
+
+@tool("Audit visibilite boutique")
+def audit_visibilite_outil(url: str = "") -> str:
+    """Contrôle la visibilité de la boutique du patron : titre, description, aperçu de partage, indexation dans les moteurs, réseaux reliés. Sans adresse, utilise la boutique Chariow du patron. Donne une liste d'actions."""
+    try:
+        return audit_visibilite(url)
+    except Exception as e:
+        return f"Audit impossible : {e}"
+
+
 @tool("Creer un logiciel")
 def creer_logiciel(nom: str, code: str, extension: str = "html") -> str:
     """Enregistre un logiciel complet dans un seul fichier (html de préférence : fonctionne sur tous les écrans ; sinon py, js, css, json, md, txt). 'code' = le contenu COMPLET du fichier. Le fichier est envoyé au patron sur Telegram. Ne s'exécute pas sur le serveur."""
@@ -1313,7 +1587,7 @@ def creer_agents():
         backstory=f"Tu es un chasseur de clients. {REGLE_STRICTE}",
         llm=get_llm("groq", 0.1),
         verbose=True,
-        tools=[chariow_ventes_outil, chariow_produits_outil, demander_outil_manquant],
+        tools=[rechercher_web_outil, lire_page_outil, chariow_ventes_outil, chariow_produits_outil, demander_outil_manquant],
     )
     marketeur = Agent(
         role="Marketeur",
@@ -1330,6 +1604,26 @@ def creer_agents():
         llm=get_llm("gemini", 0.1),
         verbose=True,
         tools=[creer_video, creer_ebook_3d, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
+    )
+    prospecteur = Agent(
+        role="Prospecteur B2B",
+        goal="Trouver de vraies entreprises susceptibles d'acheter ou de relayer les produits du patron, et préparer un premier message personnalisé pour chacune.",
+        backstory=(
+            "Tu prospectes pour le patron. Méthode : 1) regarde ses vrais produits avec l'outil Chariow produits ; "
+            "2) cherche des entreprises ou professionnels qui ont un besoin lié à ces produits ; "
+            "3) lis leur page pour vérifier ce qu'ils font ; 4) enregistre le prospect avec une raison fondée sur des faits lus. "
+            "Règles : uniquement des informations publiques et professionnelles ; jamais d'adresse inventée ; "
+            "chaque prospect a un site réel et une raison précise ; le message est court, honnête, sans fausse promesse ni fausse urgence, "
+            "et propose de ne plus écrire si la personne ne souhaite pas être contactée. "
+            "Tu ne contactes JAMAIS personne : le patron envoie lui-même les messages. "
+            f"{REGLE_STRICTE}"
+        ),
+        llm=get_llm("groq", 0.2),
+        verbose=True,
+        tools=[
+            rechercher_web_outil, lire_page_outil, enregistrer_prospect_outil,
+            chariow_produits_outil, demander_outil_manquant,
+        ],
     )
     humaniseur = Agent(
         role="Humaniseur (éditeur)",
@@ -1356,25 +1650,25 @@ def creer_agents():
         ),
         llm=get_llm("openrouter", 0.2),
         verbose=True,
-        tools=[proposer_publication, chariow_produits_outil, chariow_boutique_outil, demander_outil_manquant],
+        tools=[proposer_publication, audit_visibilite_outil, chariow_produits_outil, chariow_boutique_outil, demander_outil_manquant],
     )
-    return responsable, chercheur, marketeur, humaniseur, codeur, community_manager
+    return responsable, chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager
 
 
 def lancer_mission(ordre_du_patron):
-    responsable, chercheur, marketeur, humaniseur, codeur, community_manager = creer_agents()
+    responsable, chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager = creer_agents()
     tache = Task(
         description=(
             f"Réalise la mission suivante demandée par le patron : {ordre_du_patron}\n"
             "Méthode : le Marketeur écrit, l'Humaniseur réécrit TOUT texte destiné au public, "
             "puis le Codeur le met en forme avec ses outils (vidéo, ebook 3D, logiciel). Si le patron veut un livre ET une vidéo avec voix off, utilise l'outil 'Creer video et ebook 3D'. "
-            "Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
+            "Pour la prospection B2B, passe par le Prospecteur : il prépare des prospects et des messages que le patron enverra lui-même. Pour la visibilité de la boutique, le Community Manager utilise l'audit de visibilité. Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
             "Rien n'est publié sans validation du patron."
         ),
         expected_output="Un résultat clair, basé uniquement sur des informations vérifiables.",
     )
     crew = Crew(
-        agents=[chercheur, marketeur, humaniseur, codeur, community_manager],
+        agents=[chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager],
         tasks=[tache],
         process=Process.hierarchical,
         manager_agent=responsable,
@@ -1396,7 +1690,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bonjour patron ! Envoyez-moi un ordre.\n"
         "Pour une publication proposée : /valider ID ou /refuser ID\n"
-        "Chariow : /ventes (7j, 30j, mois, hier, aujourdhui) et /produits"
+        "Chariow : /ventes (7j, 30j, mois, hier, aujourdhui) et /produits\n"
+        "Prospection : /prospects (carnet en CSV) et /visibilite (audit de la boutique)"
     )
 
 
@@ -1442,6 +1737,29 @@ async def produits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(res[:4000])
 
 
+async def prospects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorise(update):
+        return
+    if not charger_prospects():
+        await update.message.reply_text("Le carnet de prospects est vide.")
+        return
+    chemin = await asyncio.to_thread(prospects_csv)
+    ok, detail = await asyncio.to_thread(send_telegram_document, chemin, "🎯 Carnet de prospects")
+    if not ok:
+        await update.message.reply_text(f"Envoi impossible : {detail}")
+
+
+async def visibilite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not autorise(update):
+        return
+    await update.message.reply_text("Audit en cours...")
+    try:
+        res = await asyncio.to_thread(audit_visibilite, context.args[0] if context.args else "")
+    except Exception as e:
+        res = f"Audit impossible : {e}"
+    await update.message.reply_text(res[:4000])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not autorise(update):
         return
@@ -1474,6 +1792,8 @@ def run_telegram_bot():
         bot_app.add_handler(CommandHandler("refuser", refuser))
         bot_app.add_handler(CommandHandler("ventes", ventes_cmd))
         bot_app.add_handler(CommandHandler("produits", produits_cmd))
+        bot_app.add_handler(CommandHandler("prospects", prospects_cmd))
+        bot_app.add_handler(CommandHandler("visibilite", visibilite_cmd))
         bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         bot_app.run_polling(stop_signals=None, close_loop=False)
     except Exception as e:
@@ -1655,6 +1975,29 @@ if st.button("Tester Chariow"):
             st.text(texte_c)
         except Exception as e:
             st.error(f"{titre_c} : {e}")
+
+st.subheader("🎯 Prospection et visibilité")
+cp1, cp2 = st.columns(2)
+if cp1.button("Tester la recherche web"):
+    try:
+        with st.spinner("Recherche..."):
+            st.text(resume_recherche("librairie numérique ebooks francophone", 5))
+    except Exception as e:
+        st.error(f"Recherche impossible : {e}")
+if cp2.button("Auditer la visibilité de ma boutique"):
+    try:
+        with st.spinner("Audit en cours..."):
+            st.text(audit_visibilite())
+    except Exception as e:
+        st.error(f"Audit impossible : {e}")
+liste_p = charger_prospects()
+if liste_p:
+    st.write(f"Carnet de prospects : {len(liste_p)}")
+    st.dataframe(liste_p)
+    with open(prospects_csv(), "rb") as fh_p:
+        st.download_button("Télécharger le carnet (CSV)", fh_p.read(), file_name="prospects.csv", key="dl_prospects")
+else:
+    st.caption("Carnet de prospects vide pour l'instant.")
 
 st.subheader("📁 Fichiers produits")
 fichiers = []
