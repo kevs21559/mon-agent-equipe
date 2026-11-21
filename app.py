@@ -1597,6 +1597,155 @@ def fabriquer_pdf(titre, auteur, texte, couleur="#5b2a1f"):
 
 
 # =====================================================
+# PACK AFFINITY PUBLISHER : manuscrit Word (styles nommés) + couverture + images + mode d'emploi
+# =====================================================
+# --- AFFINITY START ---
+def fabriquer_docx(titre, auteur, texte, couleur="#5b2a1f", images_sortie=None):
+    """Manuscrit Word au format A5 avec de vrais styles (Titre 1 = chapitre...). Retourne (chemin, avertissements)."""
+    from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.shared import Mm, Pt, RGBColor
+
+    avert = []
+    chapitres = _chapitres(texte, titre)
+    if not chapitres:
+        raise ValueError("Texte vide.")
+    images_sortie = images_sortie if images_sortie is not None else {}
+    brun, gris = RGBColor(0x4A, 0x2C, 0x1A), RGBColor(0x6A, 0x5A, 0x40)
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Mm(148), Mm(210)
+    sec.left_margin = sec.right_margin = Mm(18)
+    sec.top_margin, sec.bottom_margin = Mm(20), Mm(22)
+    doc.core_properties.title, doc.core_properties.author = titre, auteur
+    zoom = doc.settings.element.find(qn("w:zoom"))  # le modèle de base oublie la valeur du zoom
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+
+    def style(nom, taille, gras=False, italique=False, couleur_=None, align=None,
+              avant=0, apres=0, retrait=0, interligne=None, suivant=False, saut=False, base=None):
+        if nom in [s.name for s in doc.styles]:
+            st = doc.styles[nom]
+        else:
+            st = doc.styles.add_style(nom, WD_STYLE_TYPE.PARAGRAPH)
+            st.base_style = doc.styles[base or "Normal"]
+        st.font.name, st.font.size = "Georgia", Pt(taille)
+        st.font.bold, st.font.italic = gras, italique
+        if couleur_ is not None:
+            st.font.color.rgb = couleur_
+        rfonts = st.element.get_or_add_rPr().rFonts  # retire les polices de thème, qui l'emportent sur le nom
+        for a in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
+            rfonts.attrib.pop(qn("w:" + a), None)
+        rfonts.set(qn("w:eastAsia"), "Georgia")
+        ppr = st.element.get_or_add_pPr()
+        bord = ppr.find(qn("w:pBdr"))
+        if bord is not None:
+            ppr.remove(bord)
+        pf = st.paragraph_format
+        if align is not None:
+            pf.alignment = align
+        pf.space_before, pf.space_after, pf.first_line_indent = Pt(avant), Pt(apres), Mm(retrait)
+        if interligne:
+            pf.line_spacing = interligne
+        pf.keep_with_next, pf.page_break_before = suivant, saut
+        return st
+
+    J, C, L = WD_ALIGN_PARAGRAPH.JUSTIFY, WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.LEFT
+    style("Normal", 10.5, align=J, retrait=5, interligne=1.35)
+    style("Corps premier", 10.5, align=J, retrait=0, interligne=1.35, base="Normal")
+    style("Heading 1", 20, gras=True, couleur_=brun, align=C, avant=36, apres=18, suivant=True, saut=True)
+    style("Heading 2", 13, gras=True, couleur_=brun, align=L, avant=12, apres=6, suivant=True)
+    style("Title", 26, gras=True, couleur_=brun, align=C, avant=120, apres=12)
+    style("Subtitle", 12, couleur_=gris, align=C, avant=0, apres=0)
+    style("Caption", 8.5, italique=True, couleur_=gris, align=C, avant=2, apres=8)
+    style("Figure", 10, align=C, avant=8, apres=2, suivant=True, base="Normal")
+
+    doc.add_paragraph(titre, style="Title")
+    doc.add_paragraph(auteur.upper(), style="Subtitle")
+    mentions = doc.add_paragraph(f"© {datetime.date.today().year} {auteur}\nTous droits réservés.", style="Subtitle")
+    mentions.paragraph_format.page_break_before = True
+    mentions.paragraph_format.space_before = Pt(300)
+
+    for ch in chapitres:
+        doc.add_paragraph(ch["titre"], style="Heading 1")
+        sans_retrait = True
+        for bloc in ch["blocs"]:
+            m = MOTIF_IMAGE.match(bloc)
+            if m:
+                try:
+                    octets, (iw, ih) = _jpeg_octets(m.group(2))
+                except Exception as e:
+                    avert.append(f"Image ignorée ({m.group(2)[:60]}) : {e}")
+                    continue
+                nom_img = f"img{len(images_sortie) + 1}.jpg"
+                images_sortie[nom_img] = octets
+                doc.add_picture(BytesIO(octets), width=Mm(min(100, 80 * iw / ih)))
+                doc.paragraphs[-1].style = doc.styles["Figure"]
+                if m.group(1).strip():
+                    doc.add_paragraph(m.group(1), style="Caption")
+            elif bloc.startswith("## "):
+                doc.add_paragraph(bloc[3:], style="Heading 2")
+                sans_retrait = True
+            else:
+                doc.add_paragraph(bloc, style="Corps premier" if sans_retrait else "Normal")
+                sans_retrait = False
+
+    chemin = os.path.join(DOSSIER_FICHIERS, f"manuscrit_{_nom_fichier(titre, 'livre')}.docx")
+    doc.save(chemin)
+    return chemin, avert
+
+
+LISEZ_MOI_AFFINITY = """PACK AFFINITY PUBLISHER - {titre}
+
+CONTENU
+- manuscrit.docx : le texte au format A5, avec des styles nommés (Titre 1 = chapitre, Titre 2 = sous-titre,
+  Normal = texte, Corps premier = premier paragraphe, Légende). Les images sont déjà intégrées.
+- couverture.jpg : couverture 1800 x 2700 pixels (rapport 2:3), à placer sur la première page.
+- images/ : les images du livre en fichiers séparés, au cas où vous voulez les replacer.
+
+ETAPES DANS AFFINITY PUBLISHER (les noms de menus peuvent varier selon la version)
+1. Fichier > Nouveau : choisissez le format A5 (148 x 210 mm). Pour un livre papier, cochez les pages en
+   vis-à-vis et réglez vos marges. Pour l'impression, ajoutez le fond perdu demandé par votre imprimeur
+   (souvent 3 mm : vérifiez chez lui).
+2. Fichier > Placer : choisissez manuscrit.docx, puis cliquez dans un cadre de texte. Pour répartir le texte sur
+   toutes les pages, consultez l'aide d'Affinity (« Importing text » et le flux automatique du texte).
+3. Les styles du fichier Word sont normalement repris dans le panneau Styles : modifiez-les une seule fois
+   pour changer la mise en page de tout le livre (police, taille, interligne).
+4. Fichier > Placer : couverture.jpg pour la couverture.
+5. Fichier > Exporter : PDF. Pour un imprimeur, choisissez le préréglage PDF pour l'impression.
+
+CONSEILS
+- Relisez le texte en entier : il a été écrit avec l'aide d'une IA.
+- Vérifiez les droits de toutes les images avant de vendre le livre.
+- La couverture est générée automatiquement : remplacez-la par une couverture illustrée si vous le souhaitez.
+- Pour un livre papier (KDP, imprimeur), demandez à votre imprimeur les dimensions exactes de la couverture
+  complète (dos compris) : elles dépendent du nombre de pages et du papier.
+"""
+
+
+def fabriquer_pack_affinity(titre, auteur, texte, couleur="#5b2a1f"):
+    """Archive ZIP prête à importer dans Affinity Publisher. Retourne (chemin, avertissements)."""
+    import zipfile
+
+    images = {}
+    chemin_docx, avert = fabriquer_docx(titre, auteur, texte, couleur, images)
+    couv = BytesIO()
+    _couverture_image(titre, auteur, couleur, 1800, 2700).save(couv, format="JPEG", quality=95, dpi=(300, 300))
+    chemin = os.path.join(DOSSIER_FICHIERS, f"pack_affinity_{_nom_fichier(titre, 'livre')}.zip")
+    with zipfile.ZipFile(chemin, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(chemin_docx, "manuscrit.docx")
+        z.writestr("couverture.jpg", couv.getvalue())
+        for nom, octets in images.items():
+            z.writestr(f"images/{nom}", octets)
+        z.writestr("LISEZ-MOI.txt", LISEZ_MOI_AFFINITY.format(titre=titre))
+    return chemin, avert
+# --- AFFINITY END ---
+
+
+# =====================================================
 # PUBLICATION : YOUTUBE SHORTS
 # =====================================================
 def publier_youtube(chemin, titre, description, confidentialite=None):
@@ -1883,10 +2032,10 @@ def audit_visibilite_outil(url: str = "") -> str:
 
 @tool("Creer ebook tous formats")
 def creer_ebook_tous_formats(titre: str, auteur: str, texte: str, couleur: str = "#5b2a1f", formats: str = "pdf,epub,3d") -> str:
-    """Crée l'ebook complet en un seul appel : PDF (vrai livre A5 : couverture, page de titre, sommaire cliquable, numéros de page), EPUB (liseuses, téléphones, tablettes, s'adapte à l'écran) et livre 3D à feuilleter (HTML). 'formats' : une liste parmi pdf, epub, 3d. 'texte' : '# Chapitre' pour chaque chapitre, '## Sous-titre', paragraphes (un par ligne), images '![légende](source)' avec source = URL https, 'ia:description' ou 'fichier:nom.jpg'. Envoie chaque fichier au patron sur Telegram."""
+    """Crée l'ebook complet en un seul appel : PDF (vrai livre A5 : couverture, page de titre, sommaire cliquable, numéros de page), EPUB (liseuses, téléphones, tablettes, s'adapte à l'écran) et livre 3D à feuilleter (HTML). 'formats' : une liste parmi pdf, epub, 3d, affinity (pack à importer dans Affinity Publisher). 'texte' : '# Chapitre' pour chaque chapitre, '## Sous-titre', paragraphes (un par ligne), images '![légende](source)' avec source = URL https, 'ia:description' ou 'fichier:nom.jpg'. Envoie chaque fichier au patron sur Telegram."""
     voulus = {f.strip().lower() for f in formats.split(",")}
     lignes = []
-    for nom_f, fabrique in (("pdf", fabriquer_pdf), ("epub", fabriquer_epub), ("3d", fabriquer_ebook_3d)):
+    for nom_f, fabrique in (("pdf", fabriquer_pdf), ("epub", fabriquer_epub), ("3d", fabriquer_ebook_3d), ("affinity", fabriquer_pack_affinity)):
         if nom_f not in voulus:
             continue
         try:
@@ -1895,7 +2044,18 @@ def creer_ebook_tous_formats(titre: str, auteur: str, texte: str, couleur: str =
             lignes += [f"Avertissement {nom_f} : {a}" for a in avert]
         except Exception as e:
             lignes.append(f"Échec {nom_f} : {e}")
-    return "\n".join(lignes) or "Aucun format reconnu (pdf, epub, 3d)."
+    return "\n".join(lignes) or "Aucun format reconnu (pdf, epub, 3d, affinity)."
+
+
+@tool("Creer pack Affinity Publisher")
+def creer_pack_affinity_outil(titre: str, auteur: str, texte: str, couleur: str = "#5b2a1f") -> str:
+    """Prépare un pack ZIP à importer dans Affinity Publisher : manuscrit Word au format A5 avec styles nommés (Titre 1 = chapitre...), couverture en 1800x2700 pixels, images séparées et mode d'emploi. 'texte' : '# Chapitre', '## Sous-titre', paragraphes, images '![légende](source)'. Le pack est envoyé au patron sur Telegram. Ne pilote pas Affinity : c'est le patron qui ouvre le pack dans le logiciel."""
+    try:
+        chemin_p, avert = fabriquer_pack_affinity(titre, auteur, texte, couleur)
+        note = (" Avertissements : " + " | ".join(avert)) if avert else ""
+        return f"Pack Affinity créé : {chemin_p} ({livrer(chemin_p, f'📐 Pack Affinity Publisher : {titre}')}).{note}"
+    except Exception as e:
+        return f"Échec du pack Affinity : {e}"
 
 
 @tool("Creer un logiciel")
@@ -1948,7 +2108,7 @@ def creer_agents():
         backstory=f"Tu produis les fichiers vidéo à partir des scripts. {REGLE_STRICTE}",
         llm=get_llm("gemini", 0.1),
         verbose=True,
-        tools=[creer_video, creer_ebook_3d, creer_ebook_tous_formats, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
+        tools=[creer_video, creer_ebook_3d, creer_ebook_tous_formats, creer_pack_affinity_outil, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
     )
     prospecteur = Agent(
         role="Prospecteur B2B",
@@ -2007,7 +2167,7 @@ def lancer_mission(ordre_du_patron):
             f"Réalise la mission suivante demandée par le patron : {ordre_du_patron}\n"
             "Méthode : le Marketeur écrit, l'Humaniseur réécrit TOUT texte destiné au public, "
             "puis le Codeur le met en forme avec ses outils (vidéo, ebook 3D, logiciel). Si le patron veut un livre ET une vidéo avec voix off, utilise l'outil 'Creer video et ebook 3D'. "
-            "Pour un ebook complet (PDF, EPUB et livre 3D), utilise l'outil 'Creer ebook tous formats'. Pour la prospection B2B, passe par le Prospecteur : il prépare des prospects et des messages que le patron enverra lui-même. Pour la visibilité de la boutique, le Community Manager utilise l'audit de visibilité. Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
+            "Pour un ebook complet (PDF, EPUB et livre 3D), utilise l'outil 'Creer ebook tous formats'. Si le patron veut finaliser le livre dans Affinity Publisher, utilise l'outil 'Creer pack Affinity Publisher'. Pour la prospection B2B, passe par le Prospecteur : il prépare des prospects et des messages que le patron enverra lui-même. Pour la visibilité de la boutique, le Community Manager utilise l'audit de visibilité. Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
             "Rien n'est publié sans validation du patron."
         ),
         expected_output="Un résultat clair, basé uniquement sur des informations vérifiables.",
@@ -2324,6 +2484,21 @@ if "pack_ebook" in st.session_state:
         ce1.download_button("Télécharger le PDF", fh_e.read(), file_name="mon_livre.pdf", mime="application/pdf", key="dl_pdf_test")
     with open(p_epub, "rb") as fh_e:
         ce2.download_button("Télécharger l'EPUB", fh_e.read(), file_name="mon_livre.epub", mime="application/epub+zip", key="dl_epub_test")
+
+if st.button("Tester le pack Affinity Publisher"):
+    try:
+        creer_image_exemple()
+        with st.spinner("Création du pack..."):
+            p_aff, a3 = fabriquer_pack_affinity("Mon premier livre", "Agence IA", TEXTE_EXEMPLE, "#5b2a1f")
+        st.session_state["pack_affinity"] = (p_aff, a3)
+    except Exception as e:
+        st.error(f"Échec : {e}")
+if "pack_affinity" in st.session_state:
+    p_aff, avs_a = st.session_state["pack_affinity"]
+    for av in avs_a:
+        st.warning(av)
+    with open(p_aff, "rb") as fh_a:
+        st.download_button("Télécharger le pack Affinity (ZIP)", fh_a.read(), file_name="pack_affinity.zip", mime="application/zip", key="dl_aff_test")
 
 st.subheader("🛒 Test Chariow")
 st.caption("Lit ta boutique, tes produits et tes ventes des 30 derniers jours (lecture seule).")
