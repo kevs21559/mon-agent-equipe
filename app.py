@@ -1269,6 +1269,334 @@ def prospects_csv():
 
 
 # =====================================================
+# EBOOK : PDF (vraie mise en page de livre) ET EPUB (lisible sur toutes les liseuses et écrans)
+# =====================================================
+# --- FORMATS START ---
+def _couverture_image(titre, auteur, couleur, w=1200, h=1800):
+    """Couverture haute définition (utilisée pour le PDF et l'EPUB)."""
+    from PIL import Image, ImageDraw
+
+    base = _hex_rgb(couleur)
+    im = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(im)
+    for y in range(h):
+        f = 1.15 - 0.55 * y / h
+        d.line([(0, y), (w, y)], fill=tuple(max(0, min(255, int(c * f))) for c in base))
+    bande = int(w * 0.06)
+    for x in range(bande):  # reliure
+        a = 0.45 * (1 - x / bande)
+        d.line([(x, 0), (x, h)], fill=tuple(int(c * (1 - a)) for c in base))
+    m = int(w * 0.075)
+    d.rectangle([m, m, w - m, h - m], outline=(217, 180, 90), width=max(3, w // 300))
+    m2 = m + int(w * 0.022)
+    d.rectangle([m2, m2, w - m2, h - m2], outline=(160, 130, 60), width=max(1, w // 600))
+    f_t, f_a = _police_serif(int(w * 0.088), True), _police_serif(int(w * 0.044))
+    lignes = _lignes_px(titre, f_t, int(w * 0.66))
+    pas = int(w * 0.115)
+    y = h // 2 - (len(lignes) * pas) // 2 - int(h * 0.05)
+    for l in lignes:
+        d.text(((w - f_t.getlength(l)) / 2, y), l, font=f_t, fill=(230, 195, 106))
+        y += pas
+    d.line([(w // 2 - int(w * 0.16), y + int(h * 0.02)), (w // 2 + int(w * 0.16), y + int(h * 0.02))], fill=(217, 180, 90), width=max(2, w // 400))
+    nom = auteur.upper()
+    d.text(((w - f_a.getlength(nom)) / 2, y + int(h * 0.05)), nom, font=f_a, fill=(230, 211, 160))
+    return im
+
+
+def _jpeg_octets(source, max_px=1400, qualite=82):
+    from PIL import Image
+
+    img = Image.open(BytesIO(_charger_image(source))).convert("RGB")
+    img.thumbnail((max_px, max_px))
+    tampon = BytesIO()
+    img.save(tampon, format="JPEG", quality=qualite, optimize=True)
+    return tampon.getvalue(), img.size
+
+
+def _chapitres(texte, titre_defaut):
+    chapitres, cour = [], None
+    for bloc in [b.strip() for b in texte.split("\n") if b.strip()]:
+        if bloc.startswith("# "):
+            cour = {"titre": bloc[2:].strip(), "blocs": []}
+            chapitres.append(cour)
+        else:
+            if cour is None:
+                cour = {"titre": titre_defaut, "blocs": []}
+                chapitres.append(cour)
+            cour["blocs"].append(bloc)
+    return chapitres
+
+
+# ---------------- EPUB ----------------
+CSS_EPUB = """body{font-family:Georgia,"Times New Roman",serif;line-height:1.55;margin:0 5%;text-align:justify;-webkit-hyphens:auto;hyphens:auto}
+h1{font-size:1.7em;text-align:center;margin:2.5em 0 1.2em;page-break-before:always;color:#4a2c1a;line-height:1.2}
+h2{font-size:1.2em;margin:1.4em 0 .6em;color:#4a2c1a;text-align:left}
+p{margin:0;text-indent:1.3em}
+h1 + p,h2 + p{text-indent:0}
+h1 + p::first-letter{font-size:3em;float:left;line-height:.85;padding:.05em .08em 0 0;font-weight:bold;color:#7a3b1d}
+figure{margin:1.2em 0;text-align:center;page-break-inside:avoid}
+figure img{max-width:100%;height:auto}
+figcaption{font-size:.85em;font-style:italic;color:#6a5a40;text-indent:0;margin-top:.3em}
+.cover{text-align:center;margin:0;padding:0}
+.cover img{max-width:100%;height:auto}
+.titre-page{text-align:center;margin-top:30%}
+.titre-page h1{page-break-before:avoid;font-size:2.2em;margin-bottom:.6em}
+.titre-page p{text-indent:0;letter-spacing:.12em;text-transform:uppercase}
+.mentions{text-align:center;margin-top:50%;font-size:.85em;color:#6a5a40}
+.mentions p{text-indent:0}
+"""
+
+_XHTML_ENTETE = (
+    '<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n'
+    '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
+    'xml:lang="fr" lang="fr"><head><meta charset="utf-8"/><title>{titre}</title>'
+    '<link rel="stylesheet" type="text/css" href="style.css"/></head><body>{corps}</body></html>'
+)
+
+
+def fabriquer_epub(titre, auteur, texte, couleur="#5b2a1f"):
+    """EPUB 3 réflowable (s'adapte à la taille de l'écran). Retourne (chemin, avertissements)."""
+    import zipfile
+
+    esc = lambda s: html.escape(s, quote=True)
+    avert, images = [], {}
+    chapitres = _chapitres(texte, titre)
+    if not chapitres:
+        raise ValueError("Texte vide.")
+
+    def bloc_xhtml(bloc):
+        m = MOTIF_IMAGE.match(bloc)
+        if m:
+            try:
+                octets, _ = _jpeg_octets(m.group(2))
+            except Exception as e:
+                avert.append(f"Image ignorée ({m.group(2)[:60]}) : {e}")
+                return ""
+            nom = f"img{len(images) + 1}.jpg"
+            images[nom] = octets
+            cap = f"<figcaption>{esc(m.group(1))}</figcaption>" if m.group(1).strip() else ""
+            return f'<figure><img src="images/{nom}" alt="{esc(m.group(1))}"/>{cap}</figure>'
+        if bloc.startswith("## "):
+            return f"<h2>{esc(bloc[3:])}</h2>"
+        return f"<p>{esc(bloc)}</p>"
+
+    fichiers_ch = []
+    for i, ch in enumerate(chapitres, 1):
+        corps = f"<h1>{esc(ch['titre'])}</h1>" + "".join(bloc_xhtml(b) for b in ch["blocs"])
+        fichiers_ch.append((f"ch{i}.xhtml", ch["titre"], _XHTML_ENTETE.format(titre=esc(ch["titre"]), corps=corps)))
+
+    couv = BytesIO()
+    _couverture_image(titre, auteur, couleur).save(couv, format="JPEG", quality=90)
+    uid = "urn:uuid:" + str(uuid.uuid4())
+    maintenant = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    annee = datetime.date.today().year
+
+    page_couv = _XHTML_ENTETE.format(
+        titre="Couverture", corps='<div class="cover"><img src="images/cover.jpg" alt="Couverture"/></div>'
+    )
+    page_titre = _XHTML_ENTETE.format(
+        titre=esc(titre), corps=f'<div class="titre-page"><h1>{esc(titre)}</h1><p>{esc(auteur)}</p></div>'
+    )
+    page_mentions = _XHTML_ENTETE.format(
+        titre="Mentions", corps=f'<div class="mentions"><p>© {annee} {esc(auteur)}</p><p>Tous droits réservés.</p></div>'
+    )
+
+    manifeste = [
+        '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+        '<item id="css" href="style.css" media-type="text/css"/>',
+        '<item id="cover-image" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+        '<item id="pagecouv" href="cover.xhtml" media-type="application/xhtml+xml"/>',
+        '<item id="pagetitre" href="titre.xhtml" media-type="application/xhtml+xml"/>',
+        '<item id="pagementions" href="mentions.xhtml" media-type="application/xhtml+xml"/>',
+    ]
+    spine = ['<itemref idref="pagecouv"/>', '<itemref idref="pagetitre"/>', '<itemref idref="pagementions"/>']
+    for i, (nom, _, _) in enumerate(fichiers_ch, 1):
+        manifeste.append(f'<item id="ch{i}" href="{nom}" media-type="application/xhtml+xml"/>')
+        spine.append(f'<itemref idref="ch{i}"/>')
+    for i, nom in enumerate(images, 1):
+        manifeste.append(f'<item id="im{i}" href="images/{nom}" media-type="image/jpeg"/>')
+
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="fr">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        f'<dc:identifier id="bookid">{uid}</dc:identifier><dc:title>{esc(titre)}</dc:title>'
+        f'<dc:creator>{esc(auteur)}</dc:creator><dc:language>fr</dc:language>'
+        f'<meta property="dcterms:modified">{maintenant}</meta><meta name="cover" content="cover-image"/>'
+        f'</metadata><manifest>{"".join(manifeste)}</manifest><spine toc="ncx">{"".join(spine)}</spine></package>'
+    )
+    items_nav = "".join(f'<li><a href="{nom}">{esc(t)}</a></li>' for nom, t, _ in fichiers_ch)
+    nav = _XHTML_ENTETE.format(
+        titre="Table des matières",
+        corps=f'<nav epub:type="toc" id="toc"><h1>Table des matières</h1><ol>{items_nav}</ol></nav>',
+    )
+    points = "".join(
+        f'<navPoint id="np{i}" playOrder="{i}"><navLabel><text>{esc(t)}</text></navLabel><content src="{nom}"/></navPoint>'
+        for i, (nom, t, _) in enumerate(fichiers_ch, 1)
+    )
+    ncx = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head>'
+        f'<meta name="dtb:uid" content="{uid}"/><meta name="dtb:depth" content="1"/>'
+        '<meta name="dtb:totalPageCount" content="0"/><meta name="dtb:maxPageNumber" content="0"/></head>'
+        f'<docTitle><text>{esc(titre)}</text></docTitle><navMap>{points}</navMap></ncx>'
+    )
+    conteneur = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+        '<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>'
+    )
+
+    chemin = os.path.join(DOSSIER_FICHIERS, f"ebook_{_nom_fichier(titre, 'livre')}.epub")
+    with zipfile.ZipFile(chemin, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)  # doit être le premier fichier
+        z.writestr("META-INF/container.xml", conteneur, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/nav.xhtml", nav, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/toc.ncx", ncx, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/style.css", CSS_EPUB, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/cover.xhtml", page_couv, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/titre.xhtml", page_titre, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/mentions.xhtml", page_mentions, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/images/cover.jpg", couv.getvalue(), compress_type=zipfile.ZIP_STORED)
+        for nom, _, contenu in fichiers_ch:
+            z.writestr(f"OEBPS/{nom}", contenu, compress_type=zipfile.ZIP_DEFLATED)
+        for nom, octets in images.items():
+            z.writestr(f"OEBPS/images/{nom}", octets, compress_type=zipfile.ZIP_STORED)
+    return chemin, avert
+
+
+# ---------------- PDF ----------------
+def fabriquer_pdf(titre, auteur, texte, couleur="#5b2a1f"):
+    """PDF au format livre (A5) : couverture, page de titre, sommaire cliquable, numéros de page. Retourne (chemin, avertissements)."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+    from reportlab.lib.pagesizes import A5
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (
+        BaseDocTemplate, Frame, Image as RLImage, KeepTogether, NextPageTemplate,
+        PageBreak, PageTemplate, Paragraph, Spacer,
+    )
+    from reportlab.platypus.tableofcontents import TableOfContents
+
+    avert = []
+    chapitres = _chapitres(texte, titre)
+    if not chapitres:
+        raise ValueError("Texte vide.")
+
+    police, gras, ital = "Times-Roman", "Times-Bold", "Times-Italic"
+    for dossier in ("/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/dejavu/"):
+        if os.path.exists(dossier + "DejaVuSerif.ttf") and os.path.exists(dossier + "DejaVuSerif-Bold.ttf"):
+            pdfmetrics.registerFont(TTFont("DVSerif", dossier + "DejaVuSerif.ttf"))
+            pdfmetrics.registerFont(TTFont("DVSerif-B", dossier + "DejaVuSerif-Bold.ttf"))
+            police, gras, ital = "DVSerif", "DVSerif-B", "DVSerif"
+            if os.path.exists(dossier + "DejaVuSerif-Italic.ttf"):
+                pdfmetrics.registerFont(TTFont("DVSerif-I", dossier + "DejaVuSerif-Italic.ttf"))
+                ital = "DVSerif-I"
+            pdfmetrics.registerFontFamily("DVSerif", normal="DVSerif", bold="DVSerif-B", italic=ital, boldItalic="DVSerif-B")
+            break
+
+    brun = colors.Color(0.29, 0.17, 0.10)
+    corps = ParagraphStyle("Corps", fontName=police, fontSize=9.6, leading=14.4, alignment=TA_JUSTIFY, firstLineIndent=11, textColor=colors.Color(0.17, 0.13, 0.09))
+    premier = ParagraphStyle("Premier", parent=corps, firstLineIndent=0)
+    chap = ParagraphStyle("Chapitre", fontName=gras, fontSize=19, leading=24, alignment=TA_CENTER, textColor=brun, spaceBefore=30, spaceAfter=22)
+    sous = ParagraphStyle("SousTitre", parent=corps, fontName=gras, fontSize=11.5, leading=15, firstLineIndent=0, textColor=brun, spaceBefore=10, spaceAfter=5)
+    legende = ParagraphStyle("Legende", parent=corps, fontName=ital, fontSize=8, leading=11, alignment=TA_CENTER, firstLineIndent=0, textColor=colors.Color(0.42, 0.35, 0.25), spaceAfter=8)
+    st_titre = ParagraphStyle("TitrePage", fontName=gras, fontSize=26, leading=32, alignment=TA_CENTER, textColor=brun)
+    st_auteur = ParagraphStyle("AuteurPage", fontName=police, fontSize=11, leading=15, alignment=TA_CENTER, textColor=colors.Color(0.42, 0.35, 0.25))
+    st_mentions = ParagraphStyle("Mentions", parent=st_auteur, fontSize=8.5, leading=12)
+    st_sommaire = ParagraphStyle("SommaireTitre", fontName=gras, fontSize=16, leading=20, alignment=TA_CENTER, textColor=brun, spaceAfter=16)
+
+    W, H = A5
+    ml, mr, mt, mb = 18 * mm, 18 * mm, 20 * mm, 22 * mm
+    cover = BytesIO()
+    _couverture_image(titre, auteur, couleur).save(cover, format="JPEG", quality=92)
+    cover.seek(0)
+
+    def page_couverture(canv, doc):
+        canv.drawImage(ImageReader(cover), 0, 0, width=W, height=H)
+
+    def page_livre(canv, doc):
+        canv.saveState()
+        canv.setFont(ital, 7.5)
+        canv.setFillColor(colors.Color(0.45, 0.38, 0.28))
+        if doc.page >= 5:
+            canv.drawCentredString(W / 2, 11 * mm, str(doc.page - 4))
+            canv.drawCentredString(W / 2, H - 11 * mm, titre if doc.page % 2 == 0 else auteur)
+        canv.restoreState()
+
+    class Livre(BaseDocTemplate):
+        def afterFlowable(self, f):
+            nom = getattr(f, "_bookmarkName", None)
+            if nom:
+                texte_ch = f.getPlainText()
+                self.canv.bookmarkPage(nom)
+                self.canv.addOutlineEntry(texte_ch, nom, 0, 0)
+                self.notify("TOCEntry", (0, texte_ch, self.page - 4, nom))
+
+    chemin = os.path.join(DOSSIER_FICHIERS, f"ebook_{_nom_fichier(titre, 'livre')}.pdf")
+    doc = Livre(chemin, pagesize=A5, title=titre, author=auteur, leftMargin=ml, rightMargin=mr, topMargin=mt, bottomMargin=mb)
+    doc.addPageTemplates([
+        PageTemplate(id="couv", frames=[Frame(0, 0, W, H, 0, 0, 0, 0)], onPage=page_couverture),
+        PageTemplate(id="livre", frames=[Frame(ml, mb, W - ml - mr, H - mt - mb, 0, 0, 0, 0)], onPage=page_livre),
+    ])
+
+    toc = TableOfContents()
+    toc.dotsMinLevel = 0
+    toc.levelStyles = [ParagraphStyle("TOC0", fontName=police, fontSize=10, leading=17, leftIndent=0, rightIndent=14, textColor=brun)]
+
+    annee = datetime.date.today().year
+    story = [
+        NextPageTemplate("livre"), PageBreak(),
+        Spacer(1, 52 * mm), Paragraph(escape(titre), st_titre), Spacer(1, 9 * mm),
+        Paragraph(escape(auteur.upper()), st_auteur), PageBreak(),
+        Spacer(1, 95 * mm), Paragraph(f"© {annee} {escape(auteur)}<br/>Tous droits réservés.", st_mentions), PageBreak(),
+        Paragraph("Sommaire", st_sommaire), toc, PageBreak(),
+    ]
+    larg_max, haut_max = W - ml - mr, 78 * mm
+    for i, ch in enumerate(chapitres):
+        titre_ch = Paragraph(escape(ch["titre"]), chap)
+        titre_ch._bookmarkName = f"chap{i}"
+        story.append(titre_ch)
+        debut = True
+        for bloc in ch["blocs"]:
+            m = MOTIF_IMAGE.match(bloc)
+            if m:
+                try:
+                    octets, (iw, ih) = _jpeg_octets(m.group(2))
+                except Exception as e:
+                    avert.append(f"Image ignorée ({m.group(2)[:60]}) : {e}")
+                    continue
+                ech = min(larg_max / iw, haut_max / ih)
+                elements = [RLImage(BytesIO(octets), width=iw * ech, height=ih * ech)]
+                if m.group(1).strip():
+                    elements.append(Paragraph(escape(m.group(1)), legende))
+                story += [Spacer(1, 4 * mm), KeepTogether(elements)]
+            elif bloc.startswith("## "):
+                story.append(Paragraph(escape(bloc[3:]), sous))
+            else:
+                if debut:
+                    mots = bloc.split(" ")
+                    if len(mots) > 4:  # ouverture en petites capitales, comme dans un vrai livre
+                        bloc = " ".join(mots[:3]).upper() + " " + " ".join(mots[3:])
+                    story.append(Paragraph(escape(bloc), premier))
+                    debut = False
+                else:
+                    story.append(Paragraph(escape(bloc), corps))
+        if i < len(chapitres) - 1:
+            story.append(PageBreak())
+    doc.multiBuild(story)
+    return chemin, avert
+# --- FORMATS END ---
+
+
+# =====================================================
 # PUBLICATION : YOUTUBE SHORTS
 # =====================================================
 def publier_youtube(chemin, titre, description, confidentialite=None):
@@ -1553,6 +1881,23 @@ def audit_visibilite_outil(url: str = "") -> str:
         return f"Audit impossible : {e}"
 
 
+@tool("Creer ebook tous formats")
+def creer_ebook_tous_formats(titre: str, auteur: str, texte: str, couleur: str = "#5b2a1f", formats: str = "pdf,epub,3d") -> str:
+    """Crée l'ebook complet en un seul appel : PDF (vrai livre A5 : couverture, page de titre, sommaire cliquable, numéros de page), EPUB (liseuses, téléphones, tablettes, s'adapte à l'écran) et livre 3D à feuilleter (HTML). 'formats' : une liste parmi pdf, epub, 3d. 'texte' : '# Chapitre' pour chaque chapitre, '## Sous-titre', paragraphes (un par ligne), images '![légende](source)' avec source = URL https, 'ia:description' ou 'fichier:nom.jpg'. Envoie chaque fichier au patron sur Telegram."""
+    voulus = {f.strip().lower() for f in formats.split(",")}
+    lignes = []
+    for nom_f, fabrique in (("pdf", fabriquer_pdf), ("epub", fabriquer_epub), ("3d", fabriquer_ebook_3d)):
+        if nom_f not in voulus:
+            continue
+        try:
+            chemin_f, avert = fabrique(titre, auteur, texte, couleur)
+            lignes.append(f"{nom_f.upper()} : {chemin_f} ({livrer(chemin_f, f'📚 {titre} ({nom_f})')})")
+            lignes += [f"Avertissement {nom_f} : {a}" for a in avert]
+        except Exception as e:
+            lignes.append(f"Échec {nom_f} : {e}")
+    return "\n".join(lignes) or "Aucun format reconnu (pdf, epub, 3d)."
+
+
 @tool("Creer un logiciel")
 def creer_logiciel(nom: str, code: str, extension: str = "html") -> str:
     """Enregistre un logiciel complet dans un seul fichier (html de préférence : fonctionne sur tous les écrans ; sinon py, js, css, json, md, txt). 'code' = le contenu COMPLET du fichier. Le fichier est envoyé au patron sur Telegram. Ne s'exécute pas sur le serveur."""
@@ -1603,7 +1948,7 @@ def creer_agents():
         backstory=f"Tu produis les fichiers vidéo à partir des scripts. {REGLE_STRICTE}",
         llm=get_llm("gemini", 0.1),
         verbose=True,
-        tools=[creer_video, creer_ebook_3d, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
+        tools=[creer_video, creer_ebook_3d, creer_ebook_tous_formats, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
     )
     prospecteur = Agent(
         role="Prospecteur B2B",
@@ -1662,7 +2007,7 @@ def lancer_mission(ordre_du_patron):
             f"Réalise la mission suivante demandée par le patron : {ordre_du_patron}\n"
             "Méthode : le Marketeur écrit, l'Humaniseur réécrit TOUT texte destiné au public, "
             "puis le Codeur le met en forme avec ses outils (vidéo, ebook 3D, logiciel). Si le patron veut un livre ET une vidéo avec voix off, utilise l'outil 'Creer video et ebook 3D'. "
-            "Pour la prospection B2B, passe par le Prospecteur : il prépare des prospects et des messages que le patron enverra lui-même. Pour la visibilité de la boutique, le Community Manager utilise l'audit de visibilité. Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
+            "Pour un ebook complet (PDF, EPUB et livre 3D), utilise l'outil 'Creer ebook tous formats'. Pour la prospection B2B, passe par le Prospecteur : il prépare des prospects et des messages que le patron enverra lui-même. Pour la visibilité de la boutique, le Community Manager utilise l'audit de visibilité. Pour parler des produits ou des ventes du patron, utilise les outils Chariow : n'invente jamais de produit, de prix ni de chiffre. "
             "Rien n'est publié sans validation du patron."
         ),
         expected_output="Un résultat clair, basé uniquement sur des informations vérifiables.",
@@ -1959,6 +2304,26 @@ if st.button("Tester l'envoi YouTube (privé)"):
             st.error(res_yt)
     except Exception as e:
         st.error(f"Échec : {e}")
+
+st.subheader("📚 Ebook : PDF, EPUB et livre 3D")
+if st.button("Tester PDF + EPUB"):
+    try:
+        creer_image_exemple()
+        with st.spinner("Création du PDF et de l'EPUB..."):
+            p_pdf, a1 = fabriquer_pdf("Mon premier livre", "Agence IA", TEXTE_EXEMPLE, "#5b2a1f")
+            p_epub, a2 = fabriquer_epub("Mon premier livre", "Agence IA", TEXTE_EXEMPLE, "#5b2a1f")
+        st.session_state["pack_ebook"] = (p_pdf, p_epub, a1 + a2)
+    except Exception as e:
+        st.error(f"Échec : {e}")
+if "pack_ebook" in st.session_state:
+    p_pdf, p_epub, avs_e = st.session_state["pack_ebook"]
+    for av in avs_e:
+        st.warning(av)
+    ce1, ce2 = st.columns(2)
+    with open(p_pdf, "rb") as fh_e:
+        ce1.download_button("Télécharger le PDF", fh_e.read(), file_name="mon_livre.pdf", mime="application/pdf", key="dl_pdf_test")
+    with open(p_epub, "rb") as fh_e:
+        ce2.download_button("Télécharger l'EPUB", fh_e.read(), file_name="mon_livre.epub", mime="application/epub+zip", key="dl_epub_test")
 
 st.subheader("🛒 Test Chariow")
 st.caption("Lit ta boutique, tes produits et tes ventes des 30 derniers jours (lecture seule).")
