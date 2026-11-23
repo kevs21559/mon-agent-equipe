@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import unicodedata
 import csv
 import socket
@@ -43,8 +44,12 @@ def secret(nom, defaut=""):
 os.environ["GROQ_API_KEY"] = secret("GROQ_API_KEY")
 os.environ["GEMINI_API_KEY"] = secret("GEMINI_API_KEY")
 os.environ["OPENROUTER_API_KEY"] = secret("OPENROUTER_API_KEY")
-TELEGRAM_TOKEN = secret("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = secret("TELEGRAM_CHAT_ID").strip()
+def _nettoyer_secret(valeur):
+    return str(valeur).strip().strip("\"'").strip()
+
+
+TELEGRAM_TOKEN = _nettoyer_secret(secret("TELEGRAM_BOT_TOKEN"))
+TELEGRAM_CHAT_ID = _nettoyer_secret(secret("TELEGRAM_CHAT_ID"))
 
 MODELES = {
     "groq": secret("MODEL_GROQ", "groq/openai/gpt-oss-120b"),
@@ -91,7 +96,7 @@ def send_telegram(msg):
                 return False, r.text
         return True, "OK"
     except Exception as e:
-        return False, str(e)
+        return False, _masquer(e)
 
 
 def send_telegram_video(chemin, legende=""):
@@ -108,7 +113,7 @@ def send_telegram_video(chemin, legende=""):
             )
         return (r.ok, "OK" if r.ok else r.text)
     except Exception as e:
-        return False, str(e)
+        return False, _masquer(e)
 
 
 # =====================================================
@@ -201,7 +206,7 @@ def send_telegram_document(chemin, legende=""):
             )
         return (r.ok, "OK" if r.ok else r.text)
     except Exception as e:
-        return False, str(e)
+        return False, _masquer(e)
 
 
 def livrer(chemin, legende=""):
@@ -637,7 +642,7 @@ def send_telegram_audio(chemin, legende=""):
             )
         return (r.ok, "OK" if r.ok else r.text)
     except Exception as e:
-        return False, str(e)
+        return False, _masquer(e)
 
 
 # =====================================================
@@ -2432,7 +2437,7 @@ def rechercher_web_outil(requete: str, nombre: int = 8) -> str:
     try:
         return resume_recherche(requete, max(1, min(int(nombre), 10)))
     except Exception as e:
-        return f"Recherche impossible : {e}. Si l'erreur persiste, demande au patron une clé SERPER_API_KEY."
+        return f"Recherche impossible : {e}. Le service gratuit de recherche est limité : réessaie plus tard ou utilise les informations déjà disponibles."
 
 
 @tool("Lire une page web")
@@ -2650,12 +2655,11 @@ def lancer_mission(ordre_du_patron):
 # =====================================================
 # BOT TELEGRAM (réservé au patron)
 # =====================================================
-def autorise(update: Update):
-    return bool(TELEGRAM_CHAT_ID) and str(update.effective_chat.id) == TELEGRAM_CHAT_ID
+# --- BOT START ---
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     await update.message.reply_text(
         "Bonjour patron ! Envoyez-moi un ordre.\n"
@@ -2667,7 +2671,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def valider(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     if not context.args:
         await update.message.reply_text("Utilisation : /valider ID")
@@ -2678,7 +2682,7 @@ async def valider(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def refuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     if not context.args:
         await update.message.reply_text("Utilisation : /refuser ID")
@@ -2688,7 +2692,7 @@ async def refuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ventes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     periode = context.args[0] if context.args else "30j"
     try:
@@ -2699,7 +2703,7 @@ async def ventes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def produits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     try:
         res = await asyncio.to_thread(resume_produits)
@@ -2709,7 +2713,7 @@ async def produits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def prospects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     if not charger_prospects():
         await update.message.reply_text("Le carnet de prospects est vide.")
@@ -2721,7 +2725,7 @@ async def prospects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def visibilite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     await update.message.reply_text("Audit en cours...")
     try:
@@ -2732,7 +2736,7 @@ async def visibilite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def commentaires_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     await update.message.reply_text("Je lis tes commentaires et je prépare les réponses...")
     res = await asyncio.to_thread(preparer_reponses, 5)
@@ -2740,7 +2744,7 @@ async def commentaires_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def repondre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     if not context.args:
         await update.message.reply_text("Utilisation : /repondre ID  (ou /repondre ID ton texte)")
@@ -2759,7 +2763,7 @@ async def repondre_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ignorer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     item = PENDING_REP.pop(context.args[0], None) if context.args else None
     if item:
@@ -2768,7 +2772,7 @@ async def ignorer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not autorise(update):
+    if not await verifier(update):
         return
     ordre_recu = update.message.text
     await update.message.reply_text(f"Ordre reçu : {ordre_recu}. Je lance l'équipe.")
@@ -2787,34 +2791,167 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Erreur : {e}")
 
 
-def run_telegram_bot():
-    if not TELEGRAM_TOKEN:
-        return
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
-        bot_app.add_handler(CommandHandler("start", start))
-        bot_app.add_handler(CommandHandler("valider", valider))
-        bot_app.add_handler(CommandHandler("refuser", refuser))
-        bot_app.add_handler(CommandHandler("ventes", ventes_cmd))
-        bot_app.add_handler(CommandHandler("produits", produits_cmd))
-        bot_app.add_handler(CommandHandler("prospects", prospects_cmd))
-        bot_app.add_handler(CommandHandler("visibilite", visibilite_cmd))
-        bot_app.add_handler(CommandHandler("commentaires", commentaires_cmd))
-        bot_app.add_handler(CommandHandler("repondre", repondre_cmd))
-        bot_app.add_handler(CommandHandler("ignorer", ignorer_cmd))
-        bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        bot_app.run_polling(stop_signals=None, close_loop=False)
-    except Exception as e:
-        print(f"Erreur bot Telegram: {e}")
-
-
 @st.cache_resource
+def get_etat_bot():
+    return {"thread": None, "statut": "pas encore démarré", "erreur": "", "notifie": False, "verrou": threading.Lock()}
+
+
+ETAT_BOT = get_etat_bot()
+
+
+def _masquer(texte):
+    """Cache le token Telegram dans n'importe quel message d'erreur."""
+    t = str(texte)
+    if TELEGRAM_TOKEN:
+        t = t.replace(TELEGRAM_TOKEN, "***")
+    return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", t)
+
+
+def explication_telegram(detail):
+    d = str(detail).lower()
+    if "chat not found" in d:
+        return "Ouvre ton bot dans Telegram et appuie sur Démarrer (Start), puis vérifie TELEGRAM_CHAT_ID (envoie /id à ton bot)."
+    if "unauthorized" in d or "401" in d:
+        return "Le token est refusé : recopie TELEGRAM_BOT_TOKEN depuis @BotFather, sans espace ni guillemet en trop."
+    if "blocked" in d:
+        return "Tu as bloqué le bot : débloque-le dans Telegram."
+    if "manquant" in d:
+        return "Ajoute TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID dans les secrets Streamlit, puis Reboot app."
+    return ""
+
+
+async def verifier(update: Update) -> bool:
+    """Vrai si le message vient de toi. Sinon le bot répond (au lieu de se taire) avec l'identifiant à configurer."""
+    chat = update.effective_chat
+    if chat is None:
+        return False
+    if TELEGRAM_CHAT_ID and str(chat.id) == TELEGRAM_CHAT_ID:
+        return True
+    if update.effective_message is not None:
+        if not TELEGRAM_CHAT_ID:
+            texte = (
+                "Le bot fonctionne, mais TELEGRAM_CHAT_ID n'est pas réglé.\n"
+                f"Ton identifiant : {chat.id}\n"
+                f'Dans les secrets Streamlit, ajoute : TELEGRAM_CHAT_ID = "{chat.id}" puis fais Reboot app.'
+            )
+        else:
+            texte = (
+                "⛔ Ce chat n'est pas autorisé.\n"
+                f"Identifiant de ce chat : {chat.id}\n"
+                "Si c'est bien toi, mets cet identifiant dans TELEGRAM_CHAT_ID (secrets Streamlit), puis Reboot app."
+            )
+        try:
+            await update.effective_message.reply_text(texte)
+        except Exception as e:
+            print(f"Réponse refus impossible : {_masquer(e)}")
+    return False
+
+
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Répond à tout le monde : donne l'identifiant du chat (sert à régler TELEGRAM_CHAT_ID)."""
+    if update.effective_message is not None and update.effective_chat is not None:
+        await update.effective_message.reply_text(f"Ton identifiant Telegram : {update.effective_chat.id}")
+
+
+async def erreur_bot(update, context: ContextTypes.DEFAULT_TYPE):
+    ETAT_BOT["erreur"] = _masquer(f"{type(context.error).__name__}: {context.error}")
+    print(f"Erreur bot Telegram : {ETAT_BOT['erreur']}")
+
+
+async def apres_demarrage(app):
+    ETAT_BOT["statut"] = "actif"
+    ETAT_BOT["erreur"] = ""
+    if not ETAT_BOT.get("notifie"):
+        ETAT_BOT["notifie"] = True
+        await asyncio.to_thread(send_telegram, "🟢 Le bot est en ligne. Envoie-moi un ordre, ou /start pour la liste des commandes.")
+
+
+def construire_application():
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)  # une mission longue ne bloque plus les autres messages
+        .post_init(apres_demarrage)
+        .build()
+    )
+    for nom, fonction in (
+        ("start", start), ("id", id_cmd), ("valider", valider), ("refuser", refuser),
+        ("ventes", ventes_cmd), ("produits", produits_cmd), ("prospects", prospects_cmd),
+        ("visibilite", visibilite_cmd), ("commentaires", commentaires_cmd),
+        ("repondre", repondre_cmd), ("ignorer", ignorer_cmd),
+    ):
+        app.add_handler(CommandHandler(nom, fonction))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(erreur_bot)
+    return app
+
+
+def run_telegram_bot():
+    """Boucle de survie : si la connexion tombe ou plante, on réessaie au lieu de s'arrêter pour toujours."""
+    pause = 5
+    while TELEGRAM_TOKEN:
+        loop = None
+        try:
+            ETAT_BOT["statut"] = "connexion en cours..."
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            construire_application().run_polling(stop_signals=None, close_loop=False)
+            ETAT_BOT["statut"] = "arrêté"
+        except Exception as e:
+            ETAT_BOT["statut"] = "erreur, nouvelle tentative"
+            ETAT_BOT["erreur"] = _masquer(f"{type(e).__name__}: {e}")
+            print(f"Bot Telegram arrêté : {ETAT_BOT['erreur']}")
+        finally:
+            try:
+                if loop is not None:
+                    loop.close()
+            except Exception:
+                pass
+        time.sleep(pause)
+        pause = min(pause * 2, 60)
+
+
 def demarrer_bot():
-    t = threading.Thread(target=run_telegram_bot, daemon=True)
-    t.start()
-    return t
+    """Appelé à chaque affichage du site : relance le bot s'il n'est pas vivant."""
+    if not TELEGRAM_TOKEN:
+        ETAT_BOT["statut"] = "TELEGRAM_BOT_TOKEN absent des secrets"
+        return
+    with ETAT_BOT["verrou"]:
+        t = ETAT_BOT.get("thread")
+        if t is None or not t.is_alive():
+            t = threading.Thread(target=run_telegram_bot, daemon=True)
+            t.start()
+            ETAT_BOT["thread"] = t
+
+
+def diagnostic_telegram():
+    """Vérifie le token, le webhook et la configuration, sans jamais afficher le token."""
+    lignes = []
+    if not TELEGRAM_TOKEN:
+        return "❌ TELEGRAM_BOT_TOKEN est absent des secrets."
+    try:
+        d = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe", timeout=15).json()
+        if d.get("ok"):
+            lignes.append(f"✅ Token valide : bot @{d['result'].get('username')}")
+        else:
+            lignes.append(f"❌ Token refusé : {d.get('description')} → recopie-le depuis @BotFather.")
+        w = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getWebhookInfo", timeout=15).json().get("result", {})
+        if w.get("url"):
+            lignes.append("⚠️ Un webhook est configuré sur ce bot (il peut gêner la réception ; le bot le supprime au démarrage).")
+        lignes.append(f"Messages en attente chez Telegram : {w.get('pending_update_count', '?')}")
+        if w.get("last_error_message"):
+            lignes.append(f"Dernière erreur Telegram : {_masquer(w['last_error_message'])}")
+    except Exception as e:
+        lignes.append(f"❌ Telegram injoignable : {_masquer(e)}")
+    lignes.append(
+        f"TELEGRAM_CHAT_ID : {'réglé (se termine par ' + TELEGRAM_CHAT_ID[-3:] + ')' if TELEGRAM_CHAT_ID else '❌ absent'}"
+    )
+    t = ETAT_BOT.get("thread")
+    lignes.append(f"Programme du bot : {'vivant' if t is not None and t.is_alive() else 'arrêté'} · statut : {ETAT_BOT['statut']}")
+    if ETAT_BOT.get("erreur"):
+        lignes.append(f"Dernière erreur du bot : {ETAT_BOT['erreur']}")
+    return "\n".join(lignes)
+# --- BOT END ---
 
 
 demarrer_bot()
@@ -2854,12 +2991,26 @@ if st.session_state.get("dernier_resultat"):
         except Exception as e:
             st.error(f"Échec de la voix : {e}")
 
+st.subheader("📡 État du bot Telegram")
+st.write(f"Statut : **{ETAT_BOT['statut']}**")
+if ETAT_BOT.get("erreur"):
+    st.warning(f"Dernière erreur : {ETAT_BOT['erreur']}")
+if st.button("Vérifier le bot Telegram"):
+    st.text(diagnostic_telegram())
+st.caption("Si le site s'est endormi, le bot ne répond plus : ouvre cette page pour le réveiller. Envoie /id à ton bot pour connaître ton identifiant.")
+
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
     if st.button("Tester Telegram"):
         ok, detail = send_telegram("🔔 Test : le bot fonctionne, patron !")
-        st.success("Message envoyé.") if ok else st.error(f"Échec Telegram : {detail}")
+        if ok:
+            st.success("Message envoyé : regarde ton Telegram.")
+        else:
+            st.error(f"Échec Telegram : {_masquer(detail)}")
+            conseil = explication_telegram(detail)
+            if conseil:
+                st.info(conseil)
 with col2:
     if st.button("Tester la création de vidéo"):
         try:
