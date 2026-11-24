@@ -64,6 +64,33 @@ os.makedirs(DOSSIER_FICHIERS, exist_ok=True)
 DOSSIER_IMAGES = "/tmp/agence_images"
 os.makedirs(DOSSIER_IMAGES, exist_ok=True)
 
+# --- PROPRIETAIRE START ---
+FICHIER_PROPRIETAIRE = os.path.join(DOSSIER_FICHIERS, "proprietaire.json")
+
+
+def chat_proprietaire():
+    """Chat du patron : secret TELEGRAM_CHAT_ID s'il existe, sinon le chat associé automatiquement au premier message."""
+    if TELEGRAM_CHAT_ID:
+        return TELEGRAM_CHAT_ID
+    try:
+        with open(FICHIER_PROPRIETAIRE, encoding="utf-8") as f:
+            return str(json.load(f).get("chat_id", ""))
+    except Exception:
+        return ""
+
+
+def associer_proprietaire(chat_id):
+    with open(FICHIER_PROPRIETAIRE, "w", encoding="utf-8") as f:
+        json.dump({"chat_id": str(chat_id)}, f)
+
+
+def oublier_proprietaire():
+    try:
+        os.remove(FICHIER_PROPRIETAIRE)
+    except OSError:
+        pass
+# --- PROPRIETAIRE END ---
+
 
 # =====================================================
 # MODÈLES
@@ -82,14 +109,14 @@ def get_llm(fournisseur="groq", temp=0.2):
 # =====================================================
 def send_telegram(msg):
     """Retourne (succès, détail)."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant dans les secrets."
+    if not TELEGRAM_TOKEN or not chat_proprietaire():
+        return False, "TELEGRAM_BOT_TOKEN manquant dans les secrets, ou aucun chat associé : écris d'abord un message à ton bot sur Telegram."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         for i in range(0, max(len(msg), 1), 4000):
             r = requests.post(
                 url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[i : i + 4000]},
+                json={"chat_id": chat_proprietaire(), "text": msg[i : i + 4000]},
                 timeout=15,
             )
             if not r.ok:
@@ -100,14 +127,14 @@ def send_telegram(msg):
 
 
 def send_telegram_video(chemin, legende=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not chat_proprietaire():
         return False, "Telegram non configuré."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVideo"
     try:
         with open(chemin, "rb") as f:
             r = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": legende[:1000]},
+                data={"chat_id": chat_proprietaire(), "caption": legende[:1000]},
                 files={"video": f},
                 timeout=120,
             )
@@ -193,14 +220,14 @@ def fabriquer_video(texte, nom="video", duree_scene=3, voix=False):
 # FICHIERS PRODUITS : LIVRAISON, EBOOK 3D (FLIPBOOK), LOGICIELS
 # =====================================================
 def send_telegram_document(chemin, legende=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not chat_proprietaire():
         return False, "Telegram non configuré."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
         with open(chemin, "rb") as f:
             r = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": legende[:1000]},
+                data={"chat_id": chat_proprietaire(), "caption": legende[:1000]},
                 files={"document": f},
                 timeout=120,
             )
@@ -629,14 +656,14 @@ def synthese_vocale(texte, chemin):
 
 
 def send_telegram_audio(chemin, legende=""):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not chat_proprietaire():
         return False, "Telegram non configuré."
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendAudio"
     try:
         with open(chemin, "rb") as f:
             r = requests.post(
                 url,
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": legende[:1000]},
+                data={"chat_id": chat_proprietaire(), "caption": legende[:1000]},
                 files={"audio": f},
                 timeout=120,
             )
@@ -2046,7 +2073,7 @@ def preparer_reponses(max_n=5):
         rid = uuid.uuid4().hex[:6]
         PENDING_REP[rid] = {
             "comment_id": c["comment_id"], "auteur": c["auteur"], "texte": c["texte"],
-            "video": c["video"], "reponse": "" if a_traiter else brouillon,
+            "video": c["video"], "reponse": "" if a_traiter else brouillon, "t": time.time(),
         }
         if a_traiter:
             proposition = "(aucune : commentaire sensible ou sans information)"
@@ -2352,6 +2379,7 @@ def proposer_publication(video: str, titre: str, description: str, plateformes: 
         "hashtags": hashtags,
         "mots_cles": mots_cles,
         "plateformes": plateformes_liste,
+        "t": time.time(),
     }
     meta = preparer_metadonnees_youtube(titre, description, hashtags, mots_cles)
     tete = (
@@ -2653,6 +2681,268 @@ def lancer_mission(ordre_du_patron):
 
 
 # =====================================================
+# CONVERSATION LIBRE : tu parles normalement, le bot comprend, répond, et lance l'équipe seulement si besoin
+# =====================================================
+# --- CONVERSATION START ---
+@st.cache_resource
+def get_memoire():
+    return {}
+
+
+MEMOIRE = get_memoire()
+
+CAPACITES = (
+    "créer des vidéos verticales avec voix off, des ebooks (PDF, EPUB, livre 3D, pack Affinity Publisher), "
+    "de petits logiciels en HTML ; chercher sur le web ; prospecter des entreprises (B2B) ; auditer la visibilité "
+    "de la boutique ; préparer des publications YouTube et TikTok (titre, hashtags) qui ne partent qu'après ton accord ; "
+    "préparer des réponses aux commentaires YouTube ; lire les ventes et les produits de la boutique Chariow."
+)
+
+
+def retenir(chat_id, role, contenu):
+    m = MEMOIRE.setdefault(str(chat_id), [])
+    m.append({"role": role, "content": str(contenu)[:1500]})
+    del m[:-16]
+
+
+def oublier_conversation(chat_id):
+    MEMOIRE.pop(str(chat_id), None)
+
+
+# ---- validation en langage naturel ("oui vas-y", "non annule") ----
+def _normaliser(t):
+    t = unicodedata.normalize("NFD", (t or "").lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = t.replace("'", "").replace("’", "")
+    return re.sub(r"[^a-z0-9 ]+", " ", t).strip()
+
+
+RE_OUI = re.compile(r"^(oui|ouais|ok|okay|dac|daccord|yes|go|parfait|valide|valider|publie|publier|envoie|envoyer|vasy|cest bon|top|nickel|impec|banco)\b")
+RE_NON = re.compile(r"^(non|nan|nope|annule|annuler|refuse|refuser|stop|ignore|ignorer|pas maintenant|laisse tomber|surtout pas)\b")
+RE_AJOUT = re.compile(r"\b(et|mais|aussi|puis|cree|ecris|fais|ajoute|change|modifie|plutot)\b")
+
+
+def reponse_courte(texte):
+    """'oui' / 'non' si le message est un simple accord ou refus (4 mots max), sinon None."""
+    n = _normaliser(texte)
+    if not n or len(n.split()) > 4 or RE_AJOUT.search(n):
+        return None
+    if RE_NON.match(n):
+        return "non"
+    if RE_OUI.match(n):
+        return "oui"
+    return None
+
+
+def _en_attente(max_age=7200):
+    maintenant = time.time()
+    items = []
+    for pid, p in list(PENDING.items()):
+        if maintenant - p.get("t", maintenant) <= max_age:
+            items.append(("pub", pid, p))
+    for rid, p in list(PENDING_REP.items()):
+        if maintenant - p.get("t", maintenant) <= max_age:
+            items.append(("rep", rid, p))
+    return sorted(items, key=lambda x: x[2].get("t", 0))
+
+
+def decrire_attente():
+    items = _en_attente()
+    if not items:
+        return "Rien en attente de validation."
+    lignes = []
+    for genre, i, p in items:
+        if genre == "pub":
+            lignes.append(f"- publication {i} : « {p.get('titre', '')} » sur {', '.join(p.get('plateformes', []))}")
+        else:
+            lignes.append(f"- réponse à un commentaire {i} de {p.get('auteur', '')} : « {p.get('texte', '')[:80]} »")
+    return "\n".join(lignes)
+
+
+def traiter_validation(oui):
+    """Applique 'oui' ou 'non' à l'UNIQUE chose en attente. Retourne le texte à dire, ou None s'il n'y a rien à valider."""
+    items = _en_attente()
+    if not items:
+        return None
+    if len(items) > 1:
+        return (
+            "J'ai plusieurs choses en attente, je préfère ne pas me tromper :\n" + decrire_attente() +
+            "\nDis-moi laquelle avec son identifiant : /valider ID, /repondre ID ou /ignorer ID."
+        )
+    genre, i, p = items[0]
+    if genre == "pub":
+        if oui:
+            return "👍 C'est parti.\n" + executer_publication(i)
+        PENDING.pop(i, None)
+        return "D'accord, j'annule cette publication."
+    if oui:
+        if not p.get("reponse"):
+            return f"Pour celui-là je n'ai pas de brouillon : écris-moi la réponse avec /repondre {i} ton texte."
+        res = publier_reponse_youtube(p["comment_id"], p["reponse"])
+        if res.startswith("OK"):
+            PENDING_REP.pop(i, None)
+            _marquer_traite(p["comment_id"])
+        return res
+    PENDING_REP.pop(i, None)
+    _marquer_traite(p["comment_id"])
+    return "Ok, je laisse ce commentaire tranquille."
+
+
+# ---- cerveau de la conversation ----
+def _appel_llm(messages):
+    derniere = None
+    for fournisseur in ("groq", "gemini"):
+        try:
+            return str(get_llm(fournisseur, 0.5).call(messages)).strip()
+        except Exception as e:
+            derniere = e
+    raise RuntimeError(f"Aucun modèle disponible : {derniere}")
+
+
+def _extraire_json(sortie):
+    t = re.sub(r"^```(?:json)?|```$", "", (sortie or "").strip(), flags=re.M).strip()
+    m = re.search(r"\{.*\}", t, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0), strict=False)
+        except Exception:
+            return None
+    return None
+
+
+def _systeme(texte):
+    nom = secret("NOM_ASSISTANT", "Nova").strip() or "Nova"
+    infos = rechercher_connaissances(texte, 2)
+    infos = "" if infos.startswith(("La fiche marque", "Rien de pertinent")) else infos
+    return (
+        f"Tu es {nom}, l'associé IA du patron : tu diriges une petite équipe d'agents (chercheur, rédacteur, prospecteur, "
+        "vidéaste, community manager). Tu parles comme un collègue de confiance, pas comme un robot : tutoiement, phrases "
+        "simples et naturelles, chaleureux et direct, une touche d'humour si ça s'y prête. Pas de formules toutes faites "
+        "(« en tant qu'IA », « n'hésitez pas », « je suis là pour vous aider »). Tu ne prétends pas être humain : si on te le "
+        "demande sincèrement, tu dis que tu es une IA. Tu réponds dans la langue du patron. Une seule question à la fois, "
+        "seulement si elle est utile. Tu n'inventes jamais de chiffres, de ventes, de clients ni de faits : si tu ne sais "
+        "pas, tu le dis et tu proposes de vérifier.\n\n"
+        f"Ce que l'équipe sait faire : {CAPACITES}\n\n"
+        "Pour CHAQUE message, réponds UNIQUEMENT par un objet JSON de cette forme :\n"
+        '{"reponse": "...", "action": "aucune", "mission": "", "periode": ""}\n'
+        "- action \"aucune\" : le patron discute, pose une question, demande un avis, un conseil ou une explication, ou tu peux "
+        "répondre seul avec ce que tu sais. Mets TOUTE ta réponse dans \"reponse\" (naturelle, 1 à 5 phrases).\n"
+        "- action \"mission\" : il faut produire ou chercher quelque chose (vidéo, ebook, post, prospection, recherche web, "
+        "publication à préparer...). \"reponse\" = une courte phrase qui dit que tu t'y mets ; \"mission\" = la consigne complète "
+        "et claire pour l'équipe, en reprenant le contexte de la conversation.\n"
+        "- actions rapides \"ventes\", \"produits\", \"commentaires\", \"visibilite\", \"prospects\" : \"reponse\" = une courte intro ; "
+        "pour \"ventes\", \"periode\" vaut aujourdhui, hier, 7j, 30j, semaine, mois, mois_dernier ou annee.\n"
+        "Rien n'est publié sans l'accord du patron ; tu le rappelles seulement quand c'est utile.\n\n"
+        f"Date du jour : {datetime.date.today().isoformat()}.\n"
+        f"Fiche marque du patron :\n{fiche_courte(1200) or '(vide)'}\n"
+        + (f"\nInfos pertinentes :\n{infos}\n" if infos else "")
+        + f"\nEn attente de validation :\n{decrire_attente()}"
+    )
+
+
+def converser(chat_id, texte, envoyer, voix=False):
+    """Un tour de conversation. `envoyer(texte)` envoie chaque message au patron (Telegram ou site)."""
+    texte = (texte or "").strip()
+    if not texte:
+        return
+
+    # 1) simple accord ou refus sur ce qui attend une validation
+    rc = reponse_courte(texte)
+    if rc:
+        res = traiter_validation(rc == "oui")
+        if res:
+            retenir(chat_id, "user", texte)
+            retenir(chat_id, "assistant", res)
+            envoyer(res)
+            return
+
+    # 2) comprendre ce que veut le patron
+    historique = MEMOIRE.get(str(chat_id), [])[-12:]
+    messages = [{"role": "system", "content": _systeme(texte)}] + historique + [{"role": "user", "content": texte}]
+    try:
+        sortie = _appel_llm(messages)
+    except Exception:
+        envoyer("Je n'arrive pas à réfléchir pour l'instant (les modèles gratuits ont une limite par minute). Réessaie dans une minute 🙏")
+        return
+    d = _extraire_json(sortie) or {"reponse": sortie, "action": "aucune"}
+    reponse = str(d.get("reponse") or "").strip()
+    action = str(d.get("action") or "aucune").strip().lower()
+    retenir(chat_id, "user", texte)
+
+    if reponse:
+        envoyer(reponse)
+        retenir(chat_id, "assistant", reponse)
+        if voix:
+            _parler(reponse)
+
+    # 3) agir si nécessaire
+    if action == "mission":
+        consigne = str(d.get("mission") or texte).strip()
+        contexte = "\n".join(f"{m['role']} : {m['content'][:300]}" for m in MEMOIRE.get(str(chat_id), [])[-7:-1])
+        ordre = consigne + f"\n\n(Message d'origine du patron : {texte})" + (f"\n\nContexte récent :\n{contexte}" if contexte else "")
+        try:
+            resultat = lancer_mission(ordre)
+        except Exception as e:
+            envoyer(f"Aïe, ça a coincé pendant la mission : {_masquer(e)[:300]}")
+            return
+        envoyer("Voilà ce que l'équipe a fait :\n\n" + resultat)
+        retenir(chat_id, "assistant", "Résultat de la mission : " + resultat[:600])
+        if voix:
+            _parler(resultat[:900])
+    elif action in ("ventes", "produits", "commentaires", "visibilite", "prospects"):
+        try:
+            if action == "ventes":
+                res = resume_ventes(str(d.get("periode") or "30j"))
+            elif action == "produits":
+                res = resume_produits()
+            elif action == "commentaires":
+                res = preparer_reponses(5)
+            elif action == "visibilite":
+                res = audit_visibilite()
+            else:
+                n = len(charger_prospects())
+                if n:
+                    send_telegram_document(prospects_csv(), "🎯 Carnet de prospects")
+                    res = f"Je t'envoie le carnet sur Telegram ({n} prospects)."
+                else:
+                    res = "Le carnet de prospects est vide pour l'instant."
+        except Exception as e:
+            res = f"Je n'ai pas pu le faire : {_masquer(e)[:300]}"
+        envoyer(res)
+        retenir(chat_id, "assistant", res[:600])
+
+
+def _parler(texte):
+    """Envoie la réponse en message audio sur Telegram (voix gratuite)."""
+    try:
+        chemin = os.path.join(DOSSIER_VIDEOS, f"parole_{uuid.uuid4().hex[:6]}.mp3")
+        synthese_vocale(texte[:900], chemin)
+        send_telegram_audio(chemin, "")
+    except Exception as e:
+        print(f"Voix indisponible : {_masquer(e)}")
+
+
+def transcrire_audio(octets):
+    """Message vocal -> texte, avec Whisper chez Groq (offre gratuite, avec limites)."""
+    cle = os.environ.get("GROQ_API_KEY", "")
+    if not cle:
+        raise RuntimeError("GROQ_API_KEY manquant.")
+    r = requests.post(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {cle}"},
+        files={"file": ("vocal.ogg", octets, "audio/ogg")},
+        data={"model": secret("MODELE_STT", "whisper-large-v3-turbo"), "language": "fr", "response_format": "json"},
+        timeout=90,
+    )
+    r.raise_for_status()
+    texte = (r.json().get("text") or "").strip()
+    if not texte:
+        raise RuntimeError("Aucun texte reconnu.")
+    return texte
+# --- CONVERSATION END ---
+
+
+# =====================================================
 # BOT TELEGRAM (réservé au patron)
 # =====================================================
 # --- BOT START ---
@@ -2662,11 +2952,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await verifier(update):
         return
     await update.message.reply_text(
-        "Bonjour patron ! Envoyez-moi un ordre.\n"
-        "Pour une publication proposée : /valider ID ou /refuser ID\n"
-        "Chariow : /ventes (7j, 30j, mois, hier, aujourdhui) et /produits\n"
-        "Prospection : /prospects (carnet en CSV) et /visibilite (audit de la boutique)\n"
-        "Commentaires YouTube : /commentaires, puis /repondre ID ou /ignorer ID"
+        "Salut ! Parle-moi normalement, comme à un collègue : une question, une idée, un ordre, même un message vocal. "
+        "Je te réponds, et je lance l'équipe quand il faut produire quelque chose. Rien ne part sur tes comptes sans ton accord.\n\n"
+        "Raccourcis si tu préfères : /ventes, /produits, /commentaires, /prospects, /visibilite."
     )
 
 
@@ -2771,24 +3059,66 @@ async def ignorer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Commentaire ignoré." if item else "ID inconnu ou déjà traité.")
 
 
+async def avec_saisie(update: Update, context: ContextTypes.DEFAULT_TYPE, fonction, *args):
+    """Exécute `fonction` dans un fil séparé en affichant « écrit... » dans Telegram pendant ce temps."""
+    arret = asyncio.Event()
+
+    async def boucle():
+        while not arret.is_set():
+            try:
+                await context.bot.send_chat_action(update.effective_chat.id, "typing")
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(arret.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                pass
+
+    tache = asyncio.create_task(boucle())
+    try:
+        return await asyncio.to_thread(fonction, *args)
+    finally:
+        arret.set()
+        await tache
+
+
+def envoyer_telegram(texte):
+    ok, detail = send_telegram(texte)
+    if not ok:
+        print(f"Envoi Telegram impossible : {_masquer(detail)}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await verifier(update):
         return
-    ordre_recu = update.message.text
-    await update.message.reply_text(f"Ordre reçu : {ordre_recu}. Je lance l'équipe.")
+    msg = update.effective_message
+    voix = secret("REPONSE_VOCALE", "voix").strip().lower() == "toujours"
     try:
-        resultat = await asyncio.to_thread(lancer_mission, ordre_recu)
-        for i in range(0, len(resultat), 4000):
-            await update.message.reply_text(resultat[i : i + 4000])
-        if secret("REPONSE_VOCALE", "oui").lower() == "oui":
-            try:
-                chemin_a = os.path.join(DOSSIER_VIDEOS, f"reponse_{uuid.uuid4().hex[:6]}.mp3")
-                await asyncio.to_thread(synthese_vocale, resultat[:1200], chemin_a)
-                await asyncio.to_thread(send_telegram_audio, chemin_a, "🔊 Réponse vocale")
-            except Exception as e:
-                print(f"Réponse vocale impossible : {e}")
+        await avec_saisie(update, context, converser, str(update.effective_chat.id), msg.text or "", envoyer_telegram, voix)
     except Exception as e:
-        await update.message.reply_text(f"Erreur : {e}")
+        await msg.reply_text(_masquer(f"Oups, j'ai eu un souci : {e}")[:800])
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await verifier(update):
+        return
+    msg = update.effective_message
+    media = msg.voice or msg.audio
+    if media is None:
+        return
+    try:
+        fichier = await media.get_file()
+        octets = bytes(await fichier.download_as_bytearray())
+        texte = await asyncio.to_thread(transcrire_audio, octets)
+    except Exception as e:
+        await msg.reply_text(_masquer(f"Je n'ai pas réussi à comprendre le vocal ({e}). Tu peux me l'écrire ?")[:600])
+        return
+    await msg.reply_text(f"🎙️ J'ai compris : « {texte} »")
+    voix = secret("REPONSE_VOCALE", "voix").strip().lower() != "non"
+    try:
+        await avec_saisie(update, context, converser, str(update.effective_chat.id), texte, envoyer_telegram, voix)
+    except Exception as e:
+        await msg.reply_text(_masquer(f"Oups, j'ai eu un souci : {e}")[:800])
 
 
 @st.cache_resource
@@ -2810,35 +3140,44 @@ def _masquer(texte):
 def explication_telegram(detail):
     d = str(detail).lower()
     if "chat not found" in d:
-        return "Ouvre ton bot dans Telegram et appuie sur Démarrer (Start), puis vérifie TELEGRAM_CHAT_ID (envoie /id à ton bot)."
+        return "Ouvre ton bot dans Telegram et écris-lui un message (ou appuie sur Démarrer) : il s'associe tout seul à ton chat."
     if "unauthorized" in d or "401" in d:
         return "Le token est refusé : recopie TELEGRAM_BOT_TOKEN depuis @BotFather, sans espace ni guillemet en trop."
     if "blocked" in d:
         return "Tu as bloqué le bot : débloque-le dans Telegram."
     if "manquant" in d:
-        return "Ajoute TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID dans les secrets Streamlit, puis Reboot app."
+        return "Ajoute TELEGRAM_BOT_TOKEN dans les secrets Streamlit (puis Reboot app), et écris un message à ton bot pour qu'il s'associe à ton chat."
     return ""
 
 
 async def verifier(update: Update) -> bool:
-    """Vrai si le message vient de toi. Sinon le bot répond (au lieu de se taire) avec l'identifiant à configurer."""
+    """Accepte le patron. Au tout premier contact, le chat qui écrit est associé automatiquement (aucun identifiant à saisir)."""
     chat = update.effective_chat
     if chat is None:
         return False
-    if TELEGRAM_CHAT_ID and str(chat.id) == TELEGRAM_CHAT_ID:
+    proprio = chat_proprietaire()
+    if not proprio:
+        associer_proprietaire(chat.id)
+        if update.effective_message is not None:
+            try:
+                await update.effective_message.reply_text(
+                    "Enchanté ! Je m'associe à ce chat : c'est toi le patron. Parle-moi comme à un collègue, je m'occupe du reste 🙂"
+                )
+            except Exception as e:
+                print(f"Message d'accueil impossible : {_masquer(e)}")
+        return True
+    if str(chat.id) == proprio:
         return True
     if update.effective_message is not None:
-        if not TELEGRAM_CHAT_ID:
+        if TELEGRAM_CHAT_ID:
             texte = (
-                "Le bot fonctionne, mais TELEGRAM_CHAT_ID n'est pas réglé.\n"
-                f"Ton identifiant : {chat.id}\n"
-                f'Dans les secrets Streamlit, ajoute : TELEGRAM_CHAT_ID = "{chat.id}" puis fais Reboot app.'
+                "Ce chat n'est pas celui enregistré dans les secrets. Si c'est toi : supprime la ligne TELEGRAM_CHAT_ID "
+                f"dans les secrets Streamlit (ou remplace-la par {chat.id}), fais Reboot app, puis réécris-moi : je m'associerai tout seul."
             )
         else:
             texte = (
-                "⛔ Ce chat n'est pas autorisé.\n"
-                f"Identifiant de ce chat : {chat.id}\n"
-                "Si c'est bien toi, mets cet identifiant dans TELEGRAM_CHAT_ID (secrets Streamlit), puis Reboot app."
+                "Je suis déjà associé à un autre chat. Si c'est toi, va sur le site, section « État du bot Telegram », "
+                "clique sur « Réinitialiser l'association », puis réécris-moi."
             )
         try:
             await update.effective_message.reply_text(texte)
@@ -2882,6 +3221,7 @@ def construire_application():
     ):
         app.add_handler(CommandHandler(nom, fonction))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_error_handler(erreur_bot)
     return app
 
@@ -2943,9 +3283,11 @@ def diagnostic_telegram():
             lignes.append(f"Dernière erreur Telegram : {_masquer(w['last_error_message'])}")
     except Exception as e:
         lignes.append(f"❌ Telegram injoignable : {_masquer(e)}")
-    lignes.append(
-        f"TELEGRAM_CHAT_ID : {'réglé (se termine par ' + TELEGRAM_CHAT_ID[-3:] + ')' if TELEGRAM_CHAT_ID else '❌ absent'}"
-    )
+    proprio = chat_proprietaire()
+    if proprio:
+        lignes.append(f"Patron associé : …{proprio[-3:]} ({'secret' if TELEGRAM_CHAT_ID else 'association automatique'})")
+    else:
+        lignes.append("Patron associé : personne. Écris n'importe quoi à ton bot sur Telegram : il s'associe tout seul.")
     t = ETAT_BOT.get("thread")
     lignes.append(f"Programme du bot : {'vivant' if t is not None and t.is_alive() else 'arrêté'} · statut : {ETAT_BOT['statut']}")
     if ETAT_BOT.get("erreur"):
@@ -2960,7 +3302,25 @@ demarrer_bot()
 # INTERFACE STREAMLIT
 # =====================================================
 st.title("🤖 Mon Agence d'Agents IA")
-st.write("Bienvenue patron. Entrez votre ordre ci-dessous :")
+st.write("Bienvenue patron. Parle à l'équipe comme à un collègue (c'est le même cerveau que sur Telegram).")
+if "chat_site" not in st.session_state:
+    st.session_state["chat_site"] = []
+for role_c, texte_c in st.session_state["chat_site"]:
+    with st.chat_message(role_c):
+        st.write(texte_c)
+msg_site = st.chat_input("Écris ici...")
+if msg_site:
+    st.session_state["chat_site"].append(("user", msg_site))
+    with st.chat_message("user"):
+        st.write(msg_site)
+    reponses_site = []
+    with st.chat_message("assistant"):
+        with st.spinner("Je réfléchis..."):
+            converser("site", msg_site, reponses_site.append, False)
+        for r_site in reponses_site:
+            st.write(r_site)
+            st.session_state["chat_site"].append(("assistant", r_site))
+st.caption("Tu peux aussi donner un ordre direct avec la zone ci-dessous.")
 
 ordre = st.text_input(
     "Quel est votre ordre ? (ex: Crée un short de 5 scènes sur 3 astuces fitness et propose-le)"
@@ -2993,6 +3353,14 @@ if st.session_state.get("dernier_resultat"):
 
 st.subheader("📡 État du bot Telegram")
 st.write(f"Statut : **{ETAT_BOT['statut']}**")
+proprio_aff = chat_proprietaire()
+if proprio_aff:
+    st.write(f"Patron associé : …{proprio_aff[-3:]} ({'secret' if TELEGRAM_CHAT_ID else 'association automatique'})")
+    if not TELEGRAM_CHAT_ID and st.button("Réinitialiser l'association"):
+        oublier_proprietaire()
+        st.success("Association effacée : le prochain chat qui écrit au bot devient le patron.")
+else:
+    st.write("Patron associé : personne pour l'instant. Écris n'importe quoi à ton bot sur Telegram : il s'associe tout seul.")
 if ETAT_BOT.get("erreur"):
     st.warning(f"Dernière erreur : {ETAT_BOT['erreur']}")
 if st.button("Vérifier le bot Telegram"):
