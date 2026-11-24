@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import traceback
 import unicodedata
 import csv
 import socket
@@ -18,6 +19,10 @@ import textwrap
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+# Évite la télémétrie et les questions interactives de CrewAI (elles peuvent bloquer un programme sans écran)
+for _nom, _val in (("CREWAI_DISABLE_TELEMETRY", "true"), ("OTEL_SDK_DISABLED", "true"), ("CREWAI_TRACING_ENABLED", "false")):
+    os.environ.setdefault(_nom, _val)
 
 from crewai import Agent, Task, Crew, Process
 from crewai.llm import LLM
@@ -2567,12 +2572,19 @@ REGLE_STRICTE = (
 )
 
 
+def _llm_agent(fournisseur, temp):
+    """Par défaut tous les agents utilisent Groq (un seul fournisseur = moins de pannes). LLM_AGENTS = "mix" rétablit Gemini et OpenRouter."""
+    if secret("LLM_AGENTS", "groq").strip().lower() != "mix":
+        fournisseur = "groq"
+    return get_llm(fournisseur, temp)
+
+
 def creer_agents():
     responsable = Agent(  # pas d'outils : obligatoire pour un manager
         role="Responsable d'agence",
         goal="Découper le travail, vérifier les outils, et ne rien publier sans l'accord du patron.",
         backstory=f"Tu es le chef. Tu ne fais pas le travail, tu coordonnes. {REGLE_STRICTE}",
-        llm=get_llm("gemini", 0.1),
+        llm=_llm_agent("gemini", 0.1),
         verbose=True,
         allow_delegation=True,
     )
@@ -2580,7 +2592,7 @@ def creer_agents():
         role="Chercheur",
         goal="Trouver de vrais clients et analyser les tendances sans jamais inventer.",
         backstory=f"Tu es un chasseur de clients. {REGLE_STRICTE}",
-        llm=get_llm("groq", 0.1),
+        llm=_llm_agent("groq", 0.1),
         verbose=True,
         tools=[rechercher_web_outil, lire_page_outil, chariow_ventes_outil, chariow_produits_outil, demander_outil_manquant],
     )
@@ -2588,7 +2600,7 @@ def creer_agents():
         role="Marketeur",
         goal="Rédiger des scripts de vidéos courtes percutants (une phrase courte par ligne).",
         backstory=f"Tu es un copywriter hors pair. Tu écris pour vendre. {REGLE_STRICTE}",
-        llm=get_llm("groq", 0.2),
+        llm=_llm_agent("groq", 0.2),
         verbose=True,
         tools=[consulter_fiche_outil, chariow_produits_outil, chariow_boutique_outil],
     )
@@ -2596,9 +2608,9 @@ def creer_agents():
         role="Codeur",
         goal="Fabriquer les vidéos verticales, les ebooks 3D et les logiciels (fichier HTML complet) avec tes outils.",
         backstory=f"Tu produis les fichiers vidéo à partir des scripts. {REGLE_STRICTE}",
-        llm=get_llm("gemini", 0.1),
+        llm=_llm_agent("gemini", 0.1),
         verbose=True,
-        tools=[creer_video, creer_ebook_3d, creer_ebook_tous_formats, creer_pack_affinity_outil, creer_video_et_ebook, creer_logiciel, demander_outil_manquant],
+        tools=[creer_video, creer_ebook_3d, creer_ebook_tous_formats, creer_pack_affinity_outil, creer_video_et_ebook, creer_logiciel, proposer_publication, idees_hashtags_outil, consulter_fiche_outil, demander_outil_manquant],
     )
     prospecteur = Agent(
         role="Prospecteur B2B",
@@ -2613,7 +2625,7 @@ def creer_agents():
             "Tu ne contactes JAMAIS personne : le patron envoie lui-même les messages. "
             f"{REGLE_STRICTE}"
         ),
-        llm=get_llm("groq", 0.2),
+        llm=_llm_agent("groq", 0.2),
         verbose=True,
         tools=[
             rechercher_web_outil, lire_page_outil, enregistrer_prospect_outil,
@@ -2633,7 +2645,7 @@ def creer_agents():
             "Tu n'inventes JAMAIS de faux témoignages, de fausses citations ni de chiffres. "
             f"Tu gardes le sens et les faits du texte d'origine. {REGLE_STRICTE}"
         ),
-        llm=get_llm("groq", 0.5),
+        llm=_llm_agent("groq", 0.5),
         verbose=True,
     )
     community_manager = Agent(
@@ -2647,18 +2659,23 @@ def creer_agents():
             "Ne promets jamais un résultat de visibilité. "
             f"{REGLE_STRICTE}"
         ),
-        llm=get_llm("openrouter", 0.2),
+        llm=_llm_agent("openrouter", 0.2),
         verbose=True,
         tools=[proposer_publication, idees_hashtags_outil, consulter_fiche_outil, lire_commentaires_outil, preparer_reponses_outil, audit_visibilite_outil, chariow_produits_outil, chariow_boutique_outil, demander_outil_manquant],
     )
+    for ag in (chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager):
+        try:
+            ag.max_iter = 10  # évite les boucles sans fin
+        except Exception:
+            pass
     ctx = _ctx_marque()
     if ctx:  # la fiche marque (résumé) est ajoutée aux agents qui écrivent pour le public
-        for ag in (marketeur, prospecteur, humaniseur, community_manager):
+        for ag in (marketeur, prospecteur, humaniseur, codeur, community_manager):
             ag.backstory = ag.backstory + ctx
     return responsable, chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager
 
 
-def lancer_mission(ordre_du_patron):
+def _lancer_equipe(ordre_du_patron, options=None):
     responsable, chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager = creer_agents()
     tache = Task(
         description=(
@@ -2676,7 +2693,38 @@ def lancer_mission(ordre_du_patron):
         process=Process.hierarchical,
         manager_agent=responsable,
         max_rpm=10,
+        **(options or {}),
     )
+    return str(crew.kickoff())
+
+
+CONSIGNE_SOLO = (
+    "Fais-le toi-même, étape par étape, avec tes outils. Rédige toi-même le contenu nécessaire (script, texte, description) "
+    "en français naturel et humain, sans formules d'IA, en consultant la fiche marque si elle existe. N'invente jamais de fait, "
+    "de prix ni de chiffre. Pour créer une vidéo ou un ebook, utilise l'outil adapté (vidéo avec voix off, 'Creer ebook tous formats', "
+    "'Creer video et ebook 3D'...). Pour publier, utilise uniquement l'outil de proposition : rien n'est publié sans la validation du patron. "
+    "Quand c'est fini, termine par un compte rendu court : ce que tu as fait, les chemins des fichiers créés et ce qui attend la validation."
+)
+
+
+def lancer_mission(ordre_du_patron, agent="equipe", suivi=None):
+    """agent : codeur, prospecteur, community_manager, chercheur, marketeur (un seul spécialiste, fiable et rapide) ou equipe (hiérarchie complète)."""
+    options = {"step_callback": suivi[0], "task_callback": suivi[1]} if suivi else {}
+    if agent == "equipe":
+        return _lancer_equipe(ordre_du_patron, options)
+    responsable, chercheur, marketeur, prospecteur, humaniseur, codeur, community_manager = creer_agents()
+    specialistes = {
+        "chercheur": chercheur, "marketeur": marketeur, "prospecteur": prospecteur,
+        "codeur": codeur, "community_manager": community_manager,
+    }
+    if agent not in specialistes:
+        return _lancer_equipe(ordre_du_patron, options)
+    tache = Task(
+        description=f"Mission du patron : {ordre_du_patron}\n\n{CONSIGNE_SOLO}",
+        expected_output="Un compte rendu court et vérifiable : ce qui a été fait, les chemins des fichiers créés, et ce qui attend la validation du patron.",
+        agent=specialistes[agent],
+    )
+    crew = Crew(agents=[specialistes[agent]], tasks=[tache], process=Process.sequential, max_rpm=10, **options)
     return str(crew.kickoff())
 
 
@@ -2691,12 +2739,59 @@ def get_memoire():
 
 MEMOIRE = get_memoire()
 
+
+@st.cache_resource
+def get_etat_mission():
+    return {"etape": "", "debut": 0.0, "agent": ""}
+
+
+ETAT_MISSION = get_etat_mission()
+
+AGENTS_VALIDES = {"codeur", "prospecteur", "community_manager", "chercheur", "marketeur", "equipe"}
+NOMS_AGENTS = {
+    "codeur": "au Codeur", "prospecteur": "au Prospecteur", "community_manager": "au Community Manager",
+    "chercheur": "au Chercheur", "marketeur": "au Marketeur", "equipe": "à toute l'équipe",
+}
+PAS_SUIVI, SIGNE_PREMIER, SIGNE_PAS, DELAI_MAX_MISSION = 5, 90, 120, 20 * 60
+
 CAPACITES = (
     "créer des vidéos verticales avec voix off, des ebooks (PDF, EPUB, livre 3D, pack Affinity Publisher), "
     "de petits logiciels en HTML ; chercher sur le web ; prospecter des entreprises (B2B) ; auditer la visibilité "
     "de la boutique ; préparer des publications YouTube et TikTok (titre, hashtags) qui ne partent qu'après ton accord ; "
     "préparer des réponses aux commentaires YouTube ; lire les ventes et les produits de la boutique Chariow."
 )
+
+
+def choisir_agent(texte):
+    """Plus la tâche est ciblée, mieux ça marche : un seul spécialiste, sauf tâche vraiment mixte."""
+    n = _normaliser(texte)
+    if re.search(r"\b(ecris|redige)\b", n) and not re.search(r"\b(fais|cree|genere|produis|monte)\b", n):
+        return "marketeur"
+    if re.search(r"\b(video|videos|short|shorts|reel|reels|ebook|ebooks|pdf|epub|livre|logiciel|appli|application|affinity|voix off)\b", n):
+        return "codeur"
+    if re.search(r"\b(prospect|prospects|prospection|client|clients|entreprise|entreprises|b2b)\b", n):
+        return "prospecteur"
+    if re.search(r"\b(publie|publier|publication|hashtag|hashtags|youtube|tiktok|commentaire|commentaires|visibilite)\b", n):
+        return "community_manager"
+    if re.search(r"\b(recherche|recherches|cherche|tendance|tendances|analyse|etude)\b", n):
+        return "chercheur"
+    if re.search(r"\b(ecris|redige|texte|script|post|article|legende)\b", n):
+        return "marketeur"
+    return "equipe"
+
+
+def expliquer_erreur(e):
+    t = _masquer(str(e))
+    bas = t.lower()
+    if "429" in bas or "quota" in bas or ("rate" in bas and "limit" in bas):
+        return "Les modèles gratuits sont saturés (limite par minute ou par jour). Réessaie dans quelques minutes."
+    if "401" in bas or "api key" in bas or "api_key" in bas or "authentication" in bas:
+        return "Une clé API est refusée : vérifie GROQ_API_KEY dans les secrets (et GEMINI_API_KEY si tu utilises Gemini)."
+    if "404" in bas or "not found" in bas or "does not exist" in bas or "decommissioned" in bas:
+        return "Un modèle est introuvable ou retiré : vérifie MODEL_GROQ (et MODEL_GEMINI) dans les secrets."
+    if "importerror" in bas or "no module" in bas or "modulenotfound" in bas:
+        return "Un paquet manque : vérifie requirements.txt, puis fais Reboot app."
+    return f"Détail technique : {t[:250]}"
 
 
 def retenir(chat_id, role, contenu):
@@ -2824,12 +2919,15 @@ def _systeme(texte):
         "pas, tu le dis et tu proposes de vérifier.\n\n"
         f"Ce que l'équipe sait faire : {CAPACITES}\n\n"
         "Pour CHAQUE message, réponds UNIQUEMENT par un objet JSON de cette forme :\n"
-        '{"reponse": "...", "action": "aucune", "mission": "", "periode": ""}\n'
+        '{"reponse": "...", "action": "aucune", "mission": "", "agent": "", "periode": ""}\n'
         "- action \"aucune\" : le patron discute, pose une question, demande un avis, un conseil ou une explication, ou tu peux "
         "répondre seul avec ce que tu sais. Mets TOUTE ta réponse dans \"reponse\" (naturelle, 1 à 5 phrases).\n"
         "- action \"mission\" : il faut produire ou chercher quelque chose (vidéo, ebook, post, prospection, recherche web, "
         "publication à préparer...). \"reponse\" = une courte phrase qui dit que tu t'y mets ; \"mission\" = la consigne complète "
-        "et claire pour l'équipe, en reprenant le contexte de la conversation.\n"
+        "et claire pour l'équipe, en reprenant le contexte de la conversation. \"agent\" = le spécialiste le plus adapté : "
+        "codeur (créer vidéo, ebook, PDF, EPUB, logiciel, pack Affinity), prospecteur (trouver des entreprises ou clients B2B), "
+        "community_manager (préparer une publication YouTube/TikTok, hashtags, commentaires, visibilité), chercheur (recherche web, "
+        "tendances, analyse), marketeur (écrire un texte, script ou post) ou equipe (seulement si plusieurs métiers différents sont nécessaires).\n"
         "- actions rapides \"ventes\", \"produits\", \"commentaires\", \"visibilite\", \"prospects\" : \"reponse\" = une courte intro ; "
         "pour \"ventes\", \"periode\" vaut aujourdhui, hier, 7j, 30j, semaine, mois, mois_dernier ou annee.\n"
         "Rien n'est publié sans l'accord du patron ; tu le rappelles seulement quand c'est utile.\n\n"
@@ -2878,17 +2976,13 @@ def converser(chat_id, texte, envoyer, voix=False):
     # 3) agir si nécessaire
     if action == "mission":
         consigne = str(d.get("mission") or texte).strip()
+        agent = str(d.get("agent") or "").strip().lower()
+        if agent not in AGENTS_VALIDES:
+            agent = choisir_agent(consigne + " " + texte)
         contexte = "\n".join(f"{m['role']} : {m['content'][:300]}" for m in MEMOIRE.get(str(chat_id), [])[-7:-1])
         ordre = consigne + f"\n\n(Message d'origine du patron : {texte})" + (f"\n\nContexte récent :\n{contexte}" if contexte else "")
-        try:
-            resultat = lancer_mission(ordre)
-        except Exception as e:
-            envoyer(f"Aïe, ça a coincé pendant la mission : {_masquer(e)[:300]}")
-            return
-        envoyer("Voilà ce que l'équipe a fait :\n\n" + resultat)
-        retenir(chat_id, "assistant", "Résultat de la mission : " + resultat[:600])
-        if voix:
-            _parler(resultat[:900])
+        envoyer(f"🔧 Je confie ça {NOMS_AGENTS.get(agent, 'à toute l’équipe')}. Je te donne des nouvelles en route.")
+        suivre_mission(ordre, agent, envoyer, lambda sortie: _conclure_mission(chat_id, sortie, envoyer, voix))
     elif action in ("ventes", "produits", "commentaires", "visibilite", "prospects"):
         try:
             if action == "ventes":
@@ -2910,6 +3004,81 @@ def converser(chat_id, texte, envoyer, voix=False):
             res = f"Je n'ai pas pu le faire : {_masquer(e)[:300]}"
         envoyer(res)
         retenir(chat_id, "assistant", res[:600])
+
+
+def _callbacks_etape(envoyer):
+    """Retourne (étape, tâche) : appelés par CrewAI à chaque pas ; envoient des nouvelles sans spammer."""
+    dernier = {"t": 0.0}
+
+    def etape(step):
+        try:
+            outil = getattr(step, "tool", None)
+            if outil:
+                ETAT_MISSION["etape"] = f"outil « {outil} »"
+                if time.time() - dernier["t"] > 25:
+                    dernier["t"] = time.time()
+                    envoyer(f"🔧 {outil}...")
+            else:
+                ETAT_MISSION["etape"] = "réflexion"
+        except Exception:
+            pass
+
+    def tache(sortie_tache):
+        ETAT_MISSION["etape"] = "tâche terminée"
+
+    return etape, tache
+
+
+def _conclure_mission(chat_id, sortie, envoyer, voix):
+    if "erreur" in sortie:
+        msg = "Aïe, la mission a échoué. " + expliquer_erreur(sortie["erreur"])
+        envoyer(msg)
+        retenir(chat_id, "assistant", msg)
+        return
+    resultat = (sortie.get("texte") or "").strip() or "(l'équipe n'a rien renvoyé)"
+    envoyer("Voilà ce que l'équipe a fait :\n\n" + resultat)
+    retenir(chat_id, "assistant", "Résultat de la mission : " + resultat[:600])
+    if voix:
+        _parler(resultat[:900])
+
+
+def suivre_mission(ordre, agent, envoyer, quand_fini):
+    """Lance la mission dans un fil séparé, donne des nouvelles régulières, et ne reste jamais muet."""
+    sortie = {}
+    ETAT_MISSION.update({"etape": "démarrage", "debut": time.time(), "agent": agent})
+    suivi = _callbacks_etape(envoyer)
+
+    def cible():
+        try:
+            sortie["texte"] = lancer_mission(ordre, agent, suivi)
+            ETAT_MISSION["etape"] = "terminée"
+        except Exception as e:
+            sortie["erreur"] = e
+            ETAT_MISSION["etape"] = "échec"
+            print("Mission en échec :", _masquer(traceback.format_exc())[-1500:])
+
+    t = threading.Thread(target=cible, daemon=True)
+    t.start()
+    debut, signe = time.time(), SIGNE_PREMIER
+    while t.is_alive() and time.time() - debut < DELAI_MAX_MISSION:
+        t.join(timeout=PAS_SUIVI)
+        ecoule = time.time() - debut
+        if t.is_alive() and ecoule >= signe:
+            envoyer(f"⏳ Toujours au travail ({int(ecoule // 60)} min {int(ecoule % 60)} s) — étape : {ETAT_MISSION['etape'] or 'en cours'}")
+            signe += SIGNE_PAS
+    if t.is_alive():
+        envoyer(
+            "⚠️ Ça dure plus longtemps que prévu : les modèles gratuits sont peut-être saturés. "
+            f"Dernière étape connue : {ETAT_MISSION['etape'] or 'inconnue'}. Je continue en arrière-plan et je te préviens dès que c'est fini."
+        )
+
+        def plus_tard():
+            t.join()
+            quand_fini(sortie)
+
+        threading.Thread(target=plus_tard, daemon=True).start()
+        return
+    quand_fini(sortie)
 
 
 def _parler(texte):
@@ -3330,7 +3499,7 @@ if st.button("Lancer la mission"):
     if ordre:
         with st.spinner("Les agents travaillent..."):
             try:
-                resultat = lancer_mission(ordre)
+                resultat = lancer_mission(ordre, choisir_agent(ordre))
                 st.success("Mission terminée !")
                 st.write(resultat)
                 st.session_state["dernier_resultat"] = resultat
@@ -3353,6 +3522,8 @@ if st.session_state.get("dernier_resultat"):
 
 st.subheader("📡 État du bot Telegram")
 st.write(f"Statut : **{ETAT_BOT['statut']}**")
+if ETAT_MISSION.get("debut"):
+    st.write(f"Dernière mission : {ETAT_MISSION['agent']} · {ETAT_MISSION['etape']} · il y a {int(time.time() - ETAT_MISSION['debut'])} s")
 proprio_aff = chat_proprietaire()
 if proprio_aff:
     st.write(f"Patron associé : …{proprio_aff[-3:]} ({'secret' if TELEGRAM_CHAT_ID else 'association automatique'})")
