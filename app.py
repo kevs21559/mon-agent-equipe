@@ -3985,4 +3985,3 @@ with t_journal:
         st.session_state["chat_site"] = []
         oublier_conversation("site")
         st.rerun()
-... [Code complet du module hybride 24h/24 avec Groq, Gemini et OpenRouter] ...
